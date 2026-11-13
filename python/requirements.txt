@@ -1,0 +1,6 @@
+# Requires Python 3.10+
+furhat_realtime_api
+python-dotenv
+websockets>=14      # demos/openai_realtime*.py use the additional_headers argument
+google-genai        # Gemini: demos/gemini_simple.py
+# openai              # OpenAI demos
