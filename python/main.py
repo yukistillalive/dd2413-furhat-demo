@@ -85,6 +85,6 @@ if __name__ == "__main__":
     parser.add_argument("--no-vision", action="store_true", help="Run without the camera / vision module")
     parser.add_argument("--frame_interval", type=float, default=1.0, help="Seconds between camera frames sent to Gemini")
     parser.add_argument("--gui", action="store_true", help="Enable the Golem behaviour layer and debug panel")
-    parser.add_argument("--gui_port", type=int, default=8080, help="Port of the debug panel web page")
+    parser.add_argument("--gui_port", type=int, default=8090, help="Port of the debug panel web page (8080 is used by the Furhat SDK)")
     parser.add_argument("--debug", action="store_true", help="Print debug info from the modules")
     asyncio.run(main(parser.parse_args()))

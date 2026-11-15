@@ -41,7 +41,7 @@ class ControlPanel:
         self.actions = {name: fn for group in self.groups.values() for name, fn in group.items()}
         self.server = None
 
-    async def start(self, port: int = 8080):
+    async def start(self, port: int = 8090):
         self.server = await serve(self._handle, "127.0.0.1", port, process_request=self._http)
         print(f"Golem control panel: http://127.0.0.1:{port}")
 
