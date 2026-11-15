@@ -56,8 +56,11 @@ agree, and gaze_away when recalling something."*
    | first audio chunk in `response_audio_delta` | `await self.gui.idle.on_robot_speak_start()` |
 
    `on_robot_speak_start` and `on_robot_speak_end` are already triggered by Furhat's
-   `response.speak.start/end` events. Calling them yourself just makes the switch
-   happen sooner.
+   events. Calling them yourself just makes the switch happen sooner. Note (tested on
+   the virtual Furhat): streamed audio (`request_speak_audio_start/data/end`) sends
+   **no** `response.speak.start`, only `response.speak.audio.buffer` while playing and
+   `response.speak.end` at the end. The gui layer listens to `audio.buffer` for that reason.
+   `request_speak_text` only sends speak events when called with `wait=True`.
 
 ## 3. `main.py` (once step 2 is done)
 

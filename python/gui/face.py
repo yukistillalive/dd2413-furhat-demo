@@ -18,8 +18,12 @@ class GolemFace:
         self.furhat = furhat
         self.speaking = False      # True while the robot talks (lipsync owns the mouth)
         self.eyes_closed = False
+        self.expression = "neutral"  # last label run by expressions.perform()
         self._tasks = set()        # keep references to delayed tasks so they are not garbage-collected
-        furhat.add_handler(Events.response_speak_start, self._on_speak_start)
+        self._held = {}            # face params kept active by hold_params()
+        self._hold_task = None
+        # Streamed audio sends no speak.start, only audio.buffer events while playing
+        furhat.add_handler([Events.response_speak_start, Events.response_speak_audio_buffer], self._on_speak_start)
         furhat.add_handler(Events.response_speak_end, self._on_speak_end)
 
     async def _on_speak_start(self, _):
@@ -39,9 +43,9 @@ class GolemFace:
 
     # ---- Eyes ----
 
-    async def blink(self):
+    async def blink(self, duration: float = 1.0):
         if not self.eyes_closed:
-            await self.furhat.request_gesture_start(BLINK)
+            await self.furhat.request_gesture_start(BLINK, duration=duration)
 
     async def close_eyes(self):
         self.eyes_closed = True
@@ -70,6 +74,30 @@ class GolemFace:
         # While speaking: smile with cheeks and eyes only, then release
         await self.furhat.request_face_params({p: intensity for p in SMILE_EYES_PARAMS})
         self._later(duration, self.furhat.request_face_params, {p: 0.0 for p in SMILE_EYES_PARAMS})
+
+    # ---- Held face parameters (eyes/brows only - never MOUTH_* or JAW_*) ----
+
+    async def hold_params(self, params: dict, refresh: float = 0.0):
+        """Set face params and keep them: re-send every `refresh` s (0 = send once)."""
+        await self.release_params()
+        self._held = params
+        await self.furhat.request_face_params(params)
+        if refresh > 0:
+            self._hold_task = asyncio.create_task(self._refresh_held(refresh))
+
+    async def _refresh_held(self, interval: float):
+        while True:
+            await asyncio.sleep(interval)
+            await self.furhat.request_face_params(self._held)
+
+    async def release_params(self):
+        """Stop refreshing held params and set them back to 0."""
+        if self._hold_task:
+            self._hold_task.cancel()
+            self._hold_task = None
+        if self._held:
+            await self.furhat.request_face_params({p: 0.0 for p in self._held})
+            self._held = {}
 
     # ---- Gaze (metres relative to the robot: x right, y up, z forward) ----
 

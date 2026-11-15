@@ -34,6 +34,7 @@ class Golem:
     async def sleep(self):
         """met: lower the gaze, close the eyes, go dark."""
         self.state = "dormant"
+        await self.face.release_params()
         await self.face.gaze_location(0.0, -0.4, 1.0)
         await self.face.close_eyes()
         await self.face.set_led(MET_LED)

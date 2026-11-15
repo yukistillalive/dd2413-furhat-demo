@@ -55,8 +55,9 @@ async def main(host: str, auth_key: str | None):
 
 
 async def speak_and_smile(furhat: AsyncFurhatClient, face: GolemFace):
-    await furhat.request_speak_text("I am the Golem. Ask, and I shall answer.")
-    await asyncio.sleep(0.5)   # give response.speak.start time to arrive
+    # wait=True adds a request_id; without one the robot sends no speak.start/end events
+    asyncio.create_task(furhat.request_speak_text("I am the Golem. Ask, and I shall answer.", wait=True))
+    await asyncio.sleep(1.0)   # give response.speak.start time to arrive
     print("   face.speaking =", face.speaking)
     await face.smile(0.7)
 
