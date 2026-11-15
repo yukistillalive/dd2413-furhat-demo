@@ -29,6 +29,6 @@ python/
 ├── conversation/    Realtime Conversation: Furhat audio <-> Gemini Live websocket
 ├── vision/          Vision Perception: reads Furhat camera frames, passes them to listeners
 ├── scenario/        Scenario Setting: prompt -> WebSocket requests
-├── gui/             GUI component
+├── gui/             Golem behaviour layer: face, expressions, idle, tools, debug panel
 └── demos/           The original standalone examples from Furhat
 ```
