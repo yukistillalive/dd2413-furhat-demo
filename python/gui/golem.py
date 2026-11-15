@@ -4,7 +4,6 @@ In the myth the Golem lives while "emet" (truth) is written on its forehead,
 and returns to clay when the aleph is erased, leaving "met" (death).
 """
 from .face import GolemFace
-from .expressions import perform
 
 EMET_LED = "#c86414"   # awake: ember glow, same as the "neutral" expression
 MET_LED = "#000000"    # dormant: LED off
@@ -29,7 +28,7 @@ class Golem:
             await self.face.furhat.request_face_config(face_id=GOLEM_FACE_ID)
         await self.face.set_led(EMET_LED)
         await self.face.open_eyes()
-        await perform(self.face, "neutral")
+        await self.face.gaze_user()
         self.state = "awake"
 
     async def sleep(self):
