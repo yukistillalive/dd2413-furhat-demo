@@ -5,7 +5,7 @@
     conversation/  Realtime Conversation  - Furhat audio <-> Gemini Live
     vision/        Vision Perception      - Furhat camera frames
     scenario/      Scenario Setting       - prompt -> WebSocket requests
-    gui/           GUI component          - (not wired in yet)
+    gui/           Golem behaviour layer  - face, gaze, LED, idle, tools, debug panel (--gui)
     demos/         the original standalone examples
 """
 import argparse
@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from furhat_realtime_api import AsyncFurhatClient
 
 from conversation import RealtimeConversation
+from gui import GolemGUI
 from scenario import ScenarioManager, SCENARIOS
 from vision import VisionModule
 
@@ -29,6 +30,11 @@ async def main(args):
     except Exception as e:
         print(f"Failed to connect to Furhat on {args.host}: {e}")
         return
+
+    # Golem behaviour layer + debug panel (see gui/INTEGRATION.md for the conversation hookup)
+    gui = GolemGUI(furhat) if args.gui else None
+    if gui:
+        await gui.start(panel_port=args.gui_port)
 
     # Scenario Setting module
     if args.prompt:
@@ -64,6 +70,8 @@ async def main(args):
                 await vision.stop()
             except Exception:
                 pass
+        if gui:
+            await gui.stop()
         await furhat.disconnect()
 
 
@@ -76,5 +84,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default=None, help="Custom system prompt, overrides --scenario")
     parser.add_argument("--no-vision", action="store_true", help="Run without the camera / vision module")
     parser.add_argument("--frame_interval", type=float, default=1.0, help="Seconds between camera frames sent to Gemini")
+    parser.add_argument("--gui", action="store_true", help="Enable the Golem behaviour layer and debug panel")
+    parser.add_argument("--gui_port", type=int, default=8080, help="Port of the debug panel web page")
     parser.add_argument("--debug", action="store_true", help="Print debug info from the modules")
     asyncio.run(main(parser.parse_args()))

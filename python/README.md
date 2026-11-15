@@ -19,7 +19,7 @@ OPENAI_API_KEY=your_openai_api_key_here   # only for the OpenAI demos
 python main.py --host=192.168.0.52 --auth_key=mykey123
 ```
 
-Useful options: `--no-vision` (no camera), `--scenario default|vision`, `--prompt "..."` (custom system prompt), `--model`, `--frame_interval`, `--debug`.
+Useful options: `--gui` (Golem behaviour layer + debug panel on http://127.0.0.1:8080, see `gui/INTEGRATION.md`), `--no-vision` (no camera), `--scenario default|vision`, `--prompt "..."` (custom system prompt), `--model`, `--frame_interval`, `--debug`.
 
 ## Structure
 
