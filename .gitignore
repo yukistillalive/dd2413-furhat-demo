@@ -1,3 +1,15 @@
 python/.env
+
+# Conversation logs (transcripts of real people)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Node (debug-ui)
+node_modules/
+dist/
+.vite/
 .venv/
 __pycache__/

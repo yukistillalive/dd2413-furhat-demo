@@ -17,7 +17,7 @@ FrameListener = Callable[[str], Awaitable[None]]
 class VisionModule:
     def __init__(self, furhat: AsyncFurhatClient, frame_interval: float = 1.0, debug: bool = False):
         self.furhat = furhat
-        self.frame_interval = frame_interval  # minimum seconds between frames given to listeners
+        self.frame_interval = 5.0  # minimum seconds between frames given to listeners
         self.debug = debug
         self.latest_frame: Optional[str] = None  # newest base64 image from the robot
         self.frames_received = 0
