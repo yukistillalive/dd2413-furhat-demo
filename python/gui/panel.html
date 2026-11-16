@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Golem control panel</title>
+<style>
+  body { font-family: sans-serif; background: #1d1a17; color: #eee; margin: 20px; }
+  h2 { font-size: 15px; color: #c86414; margin: 18px 0 6px; }
+  button { margin: 3px; padding: 8px 12px; border: 0; border-radius: 4px; background: #3a332c; color: #eee; cursor: pointer; }
+  button:hover { background: #c86414; }
+  #status { margin-top: 18px; font-family: monospace; }
+</style>
+</head>
+<body>
+<h1>Golem</h1>
+<div id="buttons"></div>
+<div id="status">connecting...</div>
+<script>
+  const ws = new WebSocket(`ws://${location.host}/`);
+  const status = document.getElementById("status");
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.groups) {   // first message: build one button per action
+      for (const [group, names] of Object.entries(msg.groups)) {
+        const h = document.createElement("h2");
+        h.textContent = group;
+        document.getElementById("buttons").append(h);
+        for (const name of names) {
+          const b = document.createElement("button");
+          b.textContent = name;
+          b.onclick = () => ws.send(name);
+          document.getElementById("buttons").append(b);
+        }
+      }
+    }
+    const result = msg.error ? `ERROR ${msg.error}` : (msg.ok ? `ok: ${msg.ok}` : "connected");
+    status.textContent = `${result} | state=${msg.state} mode=${msg.mode}`;
+  };
+  ws.onclose = () => status.textContent = "disconnected";
+</script>
+</body>
+</html>
