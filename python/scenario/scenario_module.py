@@ -12,6 +12,7 @@ Two lab behaviors:
   golem    calm solemn persona, male TTS voice, the same face, slow gold light
 """
 import asyncio
+import json
 import math
 import re
 from dataclasses import dataclass, replace
@@ -28,6 +29,26 @@ VISION_NOTE = (
     " You can see the user through the robot's camera. You may comment briefly "
     "on what is actually visible. Do not invent objects or clothing."
 )
+
+REPLY_FORMAT = (
+    "Return one JSON object and no other text. "
+    'Shape: {"say":"sentence to speak","requests":[]}. '
+    "say is one or two short English sentences. "
+    "requests changes appearance and is never spoken. Use [] when nothing should change. "
+    'Allowed requests: {"type":"request.led.set","color":"#RRGGBB"}; '
+    '{"type":"request.face.config","face_id":"installed id","visibility":true,'
+    '"microexpressions":true,"blinking":true,"head_sway":false}; '
+    '{"type":"request.face.params","params":{"SMILE_CLOSED":0.4}}. '
+    "Do not request speech, listening, camera, or audio."
+)
+
+_APPEARANCE_FIELDS = {
+    "request.led.set": frozenset({"color"}),
+    "request.face.config": frozenset({"face_id", "visibility", "microexpressions", "blinking", "head_sway"}),
+    "request.face.params": frozenset({"params"}),
+}
+_HEX_COLOR = re.compile(r"^#?[0-9A-Fa-f]{6}$")
+_MOUTH_PARAM = re.compile(r"^(MOUTH|JAW)", re.I)
 
 
 @dataclass(frozen=True)
@@ -146,6 +167,127 @@ def behavior_command_phrases() -> list[str]:
     return list(_VOICE_COMMANDS)
 
 
+@dataclass(frozen=True)
+class ModelReply:
+    say: str
+    requests: tuple[dict, ...]
+
+
+def parse_model_reply(raw: str) -> ModelReply:
+    """Split a model reply into a spoken sentence and appearance requests.
+
+    Plain text with no request payload is spoken as-is. JSON that names a
+    request but cannot be validated is not spoken.
+    """
+    text = (raw or "").strip()
+    data = _json_object(text)
+    if data is None:
+        if re.search(r"request\.|^\s*[\[{]", text):
+            return ModelReply("", ())
+        return ModelReply(" ".join(text.split()), ())
+    if "say" not in data and "requests" not in data and "type" in data:
+        event = _appearance_event(data)
+        return ModelReply("", (event,) if event else ())
+    say = data.get("say", "")
+    say = " ".join(say.split()) if isinstance(say, str) else ""
+    events = []
+    incoming = data.get("requests") or []
+    if isinstance(incoming, dict):
+        incoming = [incoming]
+    if isinstance(incoming, list):
+        for item in incoming:
+            event = _appearance_event(item)
+            if event:
+                events.append(event)
+            if len(events) == 4:
+                break
+    return ModelReply(say, tuple(events))
+
+
+def _json_object(text: str) -> dict | None:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(cleaned[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _appearance_event(item) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type")
+    allowed = _APPEARANCE_FIELDS.get(kind)
+    if allowed is None:
+        return None
+    event = {"type": kind}
+    for key in allowed:
+        if key not in item:
+            continue
+        value = _appearance_value(kind, key, item[key])
+        if value is None:
+            return None
+        event[key] = value
+    if kind == "request.led.set" and "color" not in event:
+        return None
+    if kind == "request.face.params" and not event.get("params"):
+        return None
+    if len(event) == 1:
+        return None
+    return event
+
+
+def _appearance_value(kind: str, key: str, value):
+    if kind == "request.led.set" and key == "color":
+        if not isinstance(value, str) or not _HEX_COLOR.match(value.strip()):
+            return None
+        color = value.strip().lstrip("#")
+        return "#" + color.upper()
+    if key == "face_id":
+        if not isinstance(value, str):
+            return None
+        face_id = " ".join(value.split())
+        if not face_id or len(face_id) > 80:
+            return None
+        return face_id
+    if key in {"visibility", "microexpressions", "blinking", "head_sway"}:
+        return _as_bool(value)
+    if key == "params":
+        return _face_params(value)
+    return None
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    return None
+
+
+def _face_params(value) -> dict | None:
+    if not isinstance(value, dict) or not value:
+        return None
+    params = {}
+    for name, level in value.items():
+        if not isinstance(name, str) or _MOUTH_PARAM.match(name):
+            continue
+        if isinstance(level, bool) or not isinstance(level, (int, float)):
+            continue
+        if level != level or abs(level) > 100:
+            continue
+        params[name] = float(level)
+        if len(params) == 8:
+            break
+    return params or None
+
+
 def _face_entries(face_list) -> list[dict]:
     entries = []
     for item in face_list or []:
@@ -205,14 +347,14 @@ class ScenarioManager:
             instruction += VISION_NOTE
         if not instruction:
             raise ValueError("System instruction is empty")
-        return instruction
+        return instruction + "\n\n" + REPLY_FORMAT
 
     def cue_text(self, switched: bool = False) -> str:
         """Instruction that asks Gemini to write the next spoken line."""
         text = self.scenario.enter_prompt if switched else self.scenario.opening_prompt
         if not text or not text.strip():
             raise ValueError("Refusing to send an empty cue")
-        return text
+        return text.strip() + " Put the spoken line in say. Leave requests empty unless appearance should change."
 
     async def switch(self, name: str) -> bool:
         """Change behavior. Returns False if that behavior is already active."""
@@ -291,6 +433,19 @@ class ScenarioManager:
         if self.scenario.face_id:
             return self.scenario.face_id
         return self._original_face_id
+
+    async def stop_led_loop(self):
+        """Stop the preset LED loop without turning the light off."""
+        self._led_generation += 1
+        self._led_wake.set()
+        task = self._led_task
+        self._led_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     def _restart_led(self):
         self._led_generation += 1

@@ -8,6 +8,7 @@ is not used. That code is commented out in gemini_live_audio.py.
 """
 import asyncio
 import base64
+import json
 import os
 import re
 import time
@@ -16,7 +17,7 @@ from google import genai
 from google.genai import errors, types
 from furhat_realtime_api import AsyncFurhatClient, Events
 
-from scenario import ScenarioManager, behavior_command_phrases, match_behavior_command
+from scenario import ScenarioManager, behavior_command_phrases, match_behavior_command, parse_model_reply
 
 # gofast model that is still on the Gemini API. Override with --model.
 TEXT_MODEL = "gemini-3.8-flash-lite"
@@ -149,31 +150,61 @@ class RealtimeConversation:
 
     async def _speak_cue(self, switched: bool):
         cue = self.scenario.cue_text(switched=switched)
-        reply = await self._generate([self._user_content(cue)], remember=False)
-        if not reply or self.stop_event.is_set():
+        raw = await self._generate([self._user_content(cue)], remember=False)
+        if not raw or self.stop_event.is_set():
             return
-        self.history.append(types.Content(role="model", parts=[types.Part(text=reply)]))
+        say = await self._perform_reply(raw)
+        if not say or self.stop_event.is_set():
+            return
+        self.history.append(types.Content(role="model", parts=[types.Part(text=say)]))
         self._trim_history()
-        await self._speak(reply)
+        await self._speak(say)
 
     async def _complete(self, heard: str) -> str:
         user = self._user_content(heard, image_b64=self.latest_frame if self.scenario.use_vision else None)
-        reply = await self._generate(self.history + [user], remember=False)
-        if not reply:
+        raw = await self._generate(self.history + [user], remember=False)
+        if not raw:
             return ""
+        say = await self._perform_reply(raw)
         self.history.append(user)
-        self.history.append(types.Content(role="model", parts=[types.Part(text=reply)]))
+        if say:
+            self.history.append(types.Content(role="model", parts=[types.Part(text=say)]))
         self._trim_history()
-        return reply
+        return say
 
-    async def _generate(self, contents: list[types.Content], remember: bool) -> str:
+    async def _perform_reply(self, raw: str) -> str:
+        """Run appearance requests. Return only the sentence that should be spoken."""
+        reply = parse_model_reply(raw)
+        for event in reply.requests:
+            if self.stop_event.is_set():
+                break
+            await self._send_appearance(event)
+        if not reply.say and not reply.requests and re.search(r"request\.|^\s*[\[{]", raw):
+            print("[conversation] withheld reply that looked like a request")
+            await self._log_event("appearance", "reply withheld: invalid request")
+        return reply.say
+
+    async def _send_appearance(self, event: dict):
+        try:
+            if event["type"] == "request.led.set":
+                await self.scenario.stop_led_loop()
+            await self.furhat.send_event(event)
+            print("[conversation] appearance:", event["type"], {k: v for k, v in event.items() if k != "type"})
+            await self._log_event("appearance", json.dumps(event, ensure_ascii=False))
+        except Exception as e:
+            print(f"[conversation] appearance request failed: {e}")
+            await self._log_event("appearance_failed", str(e))
+
+    async def _generate(self, contents: list[types.Content], remember: bool, use_json: bool = True) -> str:
         del remember
         if time.monotonic() < self._backoff_until:
             return ""
         config = types.GenerateContentConfig(
             system_instruction=self.scenario.instruction_text(),
-            max_output_tokens=80,
+            max_output_tokens=240,
         )
+        if use_json:
+            config.response_mime_type = "application/json"
         if self.model.startswith("gemini-2.5"):
             config.thinking_config = types.ThinkingConfig(thinking_budget=0)
         try:
@@ -185,6 +216,9 @@ class RealtimeConversation:
             )
         except errors.APIError as e:
             message = str(e)
+            if use_json and "mime" in message.lower():
+                print("[conversation] JSON reply mode unavailable, asking for plain JSON text")
+                return await self._generate(contents, False, use_json=False)
             normalized = message.lower().replace("_", " ")
             if self.model != FALLBACK_MODEL and any(
                 token in normalized for token in ("not found", "not supported", "no longer available", "unavailable")
@@ -206,7 +240,7 @@ class RealtimeConversation:
             print("[conversation] Gemini text:", text)
         if not text:
             return "Sorry, I didn't catch that. Could you say it again?"
-        return " ".join(text.split())
+        return text
 
     async def _speak(self, text: str):
         print("Robot:", text)
