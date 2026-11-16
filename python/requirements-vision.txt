@@ -1,0 +1,2 @@
+# 独立 vision 调试需要的依赖；完整团队程序另见 requirements.txt。
+furhat-realtime-api==0.1.3
