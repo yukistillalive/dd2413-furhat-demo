@@ -16,6 +16,16 @@ class Scenario:
     system_instruction: str
     # Text sent as the first user turn so the robot speaks first
     opening_prompt: str = "Please greet the user."
+    language_code: str = "en-US"
+    voice_name: str | None = None  # e.g. "Puck"; None = model default
+
+
+# Appended to every system prompt so the robot stays in English.
+ENGLISH_RULE = (
+    " Always speak English only, even if the user speaks another language or the audio is "
+    "unclear: in that case politely ask them, in English, to repeat. Keep replies short "
+    "and conversational (one to three sentences)."
+)
 
 
 SCENARIOS = {
@@ -44,13 +54,31 @@ class ScenarioManager:
 
     # ---- Prompt -> WebSocket request translation ----
 
-    def build_setup_message(self, model: str) -> dict:
-        """First message of a Gemini Live session (model, output type, system prompt)."""
+    def build_setup_message(self, model: str, resume_handle: str | None = None) -> dict:
+        """First message of a Gemini Live session.
+
+        Sets model, audio output, English speech, turn detection, transcription
+        (for logging), session resumption and context compression (long chats).
+        """
+        speech = {"languageCode": self.scenario.language_code}
+        if self.scenario.voice_name:
+            speech["voiceConfig"] = {"prebuiltVoiceConfig": {"voiceName": self.scenario.voice_name}}
         return {
             "setup": {
                 "model": "models/" + model,
-                "generationConfig": {"responseModalities": ["AUDIO"]},
-                "systemInstruction": {"parts": [{"text": self.scenario.system_instruction}]},
+                "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": speech},
+                "systemInstruction": {"parts": [{"text": self.scenario.system_instruction + ENGLISH_RULE}]},
+                "realtimeInputConfig": {
+                    "automaticActivityDetection": {
+                        "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
+                        "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                        "silenceDurationMs": 700,
+                    }
+                },
+                "inputAudioTranscription": {},
+                "outputAudioTranscription": {},
+                "sessionResumption": {"handle": resume_handle} if resume_handle else {},
+                "contextWindowCompression": {"slidingWindow": {}},
             }
         }
 

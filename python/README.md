@@ -19,7 +19,7 @@ OPENAI_API_KEY=your_openai_api_key_here   # only for the OpenAI demos
 python main.py --host=192.168.0.52 --auth_key=mykey123
 ```
 
-Useful options: `--no-vision` (no camera), `--scenario default|vision`, `--prompt "..."` (custom system prompt), `--model`, `--frame_interval`, `--debug`.
+Useful options: `--no-vision` (no camera), `--scenario default|vision`, `--model`, `--frame_interval`, `--log-db conversations.db` (save the transcript to SQLite), `--debug`.
 
 ## Structure
 
@@ -27,6 +27,7 @@ Useful options: `--no-vision` (no camera), `--scenario default|vision`, `--promp
 python/
 ├── main.py          Entry point: connects to Furhat and wires the modules together
 ├── conversation/    Realtime Conversation: Furhat audio <-> Gemini Live websocket
+├── store/           Conversation log: SQLite transcript of every session
 ├── vision/          Vision Perception: reads Furhat camera frames, passes them to listeners
 ├── scenario/        Scenario Setting: prompt -> WebSocket requests
 ├── gui/             GUI component
