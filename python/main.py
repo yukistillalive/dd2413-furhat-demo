@@ -7,7 +7,7 @@
     debug_hub/     Debug hub              - live feed for ../debug-ui (--debug-ui)
     vision/        Vision Perception      - Furhat camera frames
     scenario/      Scenario Setting       - prompt -> WebSocket requests
-    gui/           GUI component          - (not wired in yet)
+    gui/           Golem behaviour layer  - face, gaze, LED, idle, tools, debug panel (--gui)
     demos/         the original standalone examples
 """
 import argparse
@@ -22,6 +22,7 @@ from furhat_realtime_api import AsyncFurhatClient
 from conversation import RealtimeConversation
 from conversation.realtime_conversation import TEXT_MODEL
 from debug_hub import DebugHub, DEFAULT_PORT
+from gui import GolemGUI
 from scenario import ScenarioManager, SCENARIOS
 from store import ConversationLog
 from vision import VisionModule
@@ -39,6 +40,12 @@ async def main(args):
 
     # Scenario Setting module. Camera-on does not replace the chatbot persona;
     # it only adds a vision sentence inside the active behavior's prompt.
+    # Golem behaviour layer + debug panel (see gui/INTEGRATION.md for the conversation hookup)
+    gui = GolemGUI(furhat) if args.gui else None
+    if gui:
+        await gui.start(panel_port=args.gui_port)
+
+    # Scenario Setting module
     if args.prompt:
         scenario = ScenarioManager.from_prompt(args.prompt)
         scenario.golem_face_id = args.golem_face
@@ -91,6 +98,8 @@ async def main(args):
                 await vision.stop()
             except Exception:
                 pass
+        if gui:
+            await gui.stop()
         await furhat.disconnect()
         if hub:
             await hub.stop()
@@ -137,5 +146,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-db", type=str, default=None, help="SQLite file for the text transcript (e.g. conversations.db)")
     parser.add_argument("--debug-ui", action="store_true", help="Stream camera and transcript to the debug-ui page on localhost")
     parser.add_argument("--debug-ui-port", type=int, default=DEFAULT_PORT, help=f"Port for --debug-ui (default {DEFAULT_PORT})")
+    parser.add_argument("--gui", action="store_true", help="Enable the Golem behaviour layer and debug panel")
+    parser.add_argument("--gui_port", type=int, default=8090, help="Port of the debug panel web page (8080 is used by the Furhat SDK)")
     parser.add_argument("--debug", action="store_true", help="Print debug info from the modules")
     asyncio.run(main(parser.parse_args()))

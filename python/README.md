@@ -61,6 +61,7 @@ cd debug-ui && npm install && npm run dev
 ```
 
 The text path still speaks with Furhat TTS. The page only watches that conversation.
+Useful options: `--gui` (Golem behaviour layer + debug panel on http://127.0.0.1:8090, see `gui/INTEGRATION.md`), `--no-vision` (no camera), `--scenario default|vision`, `--prompt "..."` (custom system prompt), `--model`, `--frame_interval`, `--debug`.
 
 ## Structure
 
@@ -71,7 +72,7 @@ python/
 ├── store/           SQLite transcript used when --log-db is set
 ├── debug_hub/       Local WebSocket feed for ../debug-ui
 ├── vision/          Vision Perception: reads Furhat camera frames, passes them to listeners
-├── scenario/        Scenario Setting: behavior -> prompt and Furhat face/voice/LED requests
-├── gui/             GUI component
+├── scenario/        Scenario Setting: prompt -> WebSocket requests
+├── gui/             Golem behaviour layer: face, expressions, idle, tools, debug panel
 └── demos/           The original standalone examples from Furhat
 ```
