@@ -1,4 +1,9 @@
 python/.env
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
 
 # Conversation logs (transcripts of real people)
 *.db

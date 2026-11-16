@@ -14,6 +14,16 @@ FURHAT_HOST=192.168.1.114
 OPENAI_API_KEY=your_openai_api_key_here   # only for the OpenAI demos
 ```
 
+## Vision prototype (independent debugger)
+
+From the repository root, run `.venv/bin/python python/vision_debug.py --simulate`
+and open http://127.0.0.1:8765. This uses simulated data; it does not start the conversation.
+For a robot, use `--host ROBOT_IP` and optionally `--camera`. Distance classification
+is disabled until the actual units are confirmed and `--distance-unit m` or `cm` is supplied.
+Install `requirements-vision.txt` for this debugger, or `requirements.txt`
+for the full backend.
+
+## Running the conversation backend
 `python/.env` is gitignored. `main.py` reads `FURHAT_HOST` from that file, so the host flag can be omitted.
 
 ## Running the backend

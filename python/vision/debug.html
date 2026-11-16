@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ask the Golem · Vision 调试</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f3f5f1;color:#20382c;font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}main{max-width:1160px;margin:auto;padding:32px 24px}h1{font-size:30px;letter-spacing:-.6px;margin:6px 0}h2{font-size:18px;margin:0 0 12px}p{margin:8px 0}header{margin-bottom:24px}.muted{color:#647466}.badge{display:inline-block;padding:5px 12px;border-radius:30px;background:#e0e8dc;font-weight:650}.warn{background:#fff0cc;color:#785000}.bad{background:#fce0dc;color:#942e26}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}.card{background:white;border:1px solid #dce3d8;border-radius:16px;padding:20px;min-width:0}.value{font-size:27px;font-weight:650;margin-top:6px;overflow-wrap:anywhere}.columns{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}.controls{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}button{background:#fff;border:1px solid #bdcbbb;color:#20382c;padding:9px 13px;border-radius:9px;font:inherit;cursor:pointer}button:hover,button.active{background:#203f2c;color:#fff}button:disabled{opacity:.5;cursor:default}#view{height:260px;display:flex;align-items:center;justify-content:center;background:#f0f3ed;border-radius:12px;position:relative;overflow:hidden}#camera{width:100%;height:100%;object-fit:contain}#scene{display:flex;align-items:center;gap:36px;text-align:center}.robot{width:88px;height:100px;border:3px solid #79947a;border-radius:45px 45px 20px 20px;display:grid;place-items:center}.person{width:65px;height:65px;background:#d7e4ce;border:2px solid #79947a;border-radius:50%;display:grid;place-items:center}.line{width:100px;border-top:2px dashed #91a68d}pre{font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}#events{padding-left:24px;max-height:240px;overflow:auto}#events li{margin-bottom:5px}#policy{border-left:4px solid #a7bf90;padding-left:12px;margin-top:18px}.small{font-size:13px}details{margin-top:18px}footer{margin-top:22px}.statusline{display:flex;gap:10px;flex-wrap:wrap;align-items:center}@media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}.columns{grid-template-columns:1fr}main{padding:20px 14px}h1{font-size:24px}}
+</style>
+<main>
+<header><span class="muted small">DD2413 · ASK THE GOLEM</span><h1>Vision 视觉模块调试</h1>
+<div class="statusline"><span id="source" class="badge warn">正在连接本地程序…</span><span id="health" class="badge">等待数据</span><span id="age" class="muted small"></span></div>
+<p class="muted">观察机器人检测到了什么。距离表示位置，不代表情绪、信任或分享意愿。</p></header>
+<section class="card" id="simulation" hidden><h2>模拟情境</h2><p class="small muted">按钮只切换模拟数据。自动播放一轮约 41 秒，随后循环。</p><div class="controls">
+<button data-case="auto">自动播放</button><button data-case="none">无人 / 持续离开</button><button data-case="far">有人 · 远处</button><button data-case="near">有人 · 靠近</button><button data-case="two">两个人</button><button data-case="occlusion">遮挡 1 秒后恢复</button><button data-case="missing">距离缺失</button><button data-case="stale">数据中断</button>
+</div><span id="scenario" class="small muted"></span></section>
+<section class="grid" style="margin-top:16px">
+<div class="card"><span class="muted">检测人数</span><div class="value" id="count">—</div></div>
+<div class="card"><span class="muted">当前目标</span><div class="value" id="target">—</div></div>
+<div class="card"><span class="muted">距离（米）</span><div class="value" id="distance">—</div></div>
+<div class="card"><span class="muted">距离分区</span><div class="value" id="zone">未知</div></div>
+</section>
+<section class="columns"><div class="card"><h2 id="viewTitle">观察视图</h2><div id="view"><img id="camera" alt="机器人摄像头画面" hidden><div id="scene"><div class="robot">Furhat</div><div class="line"></div><div><div class="person" id="person">?</div><div id="sceneText" class="small">等待数据</div></div></div></div>
+<p id="frameHint" class="small muted"></p><div id="policy"><strong>行为建议预览 · 待团队接入</strong><p id="suggestion">等待有效感知数据。</p></div></div>
+<div class="card"><h2>状态变化记录</h2><p id="tracking" class="small muted"></p><ol id="events"><li>等待状态变化。</li></ol><p id="error" class="small"></p></div></section>
+<details class="card"><summary>查看程序输出 / 原始用户字段</summary><pre id="raw"></pre></details>
+<footer class="muted small">初版调试入口不发送说话、注视、动作或云模型请求。真实模式的距离单位默认未知，需现场确认；1.2 / 1.5 米为开发参数。</footer>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const zones={none:'无人',far:'远处',interaction:'交谈区',unknown:'未知'};
+const tracking={none:'未检测到用户',confirming:'正在确认稳定目标',tracking:'正在跟踪目标',temporarily_lost:'目标暂时丢失：正在等待恢复',missing_id:'检测数据缺少用户 ID',unknown:'当前观察无效'};
+const names={person_entered:'稳定检测到目标进入',person_left:'目标持续离开',zone_changed:'距离分区变化',perception_stale:'用户数据已过期',perception_recovered:'用户数据已恢复',perception_error:'用户数据读取错误'};
+const cases={auto:'自动播放',none:'无人 / 持续离开',far:'有人 · 远处',near:'有人 · 靠近',two:'两个人',occlusion:'短暂遮挡',missing:'距离缺失',stale:'数据中断'};
+let lastFrame='', fetchingFrame=false;
+function offline(){ $('health').textContent='本地程序连接中断';$('health').className='badge bad';['count','target','distance'].forEach(id=>$(id).textContent='—');$('zone').textContent='未知';$('camera').hidden=true;$('scene').hidden=false;$('sceneText').textContent='当前观察无效';$('person').textContent='?';$('suggestion').textContent='观察已失效，请检查终端中的程序是否仍在运行。'; }
+async function refresh(){
+ try{
+  const response=await fetch('/api/state',{signal:AbortSignal.timeout(1800)}); if(!response.ok)throw Error('HTTP');
+  const d=await response.json(),s=d.state||{},sim=d.source==='simulated',ok=s.status==='ok';
+  $('source').textContent=sim?'模拟数据 · 未连接机器人':'真实机器人数据';$('source').className=sim?'badge warn':'badge';
+  $('health').textContent=({starting:'正在等待首次数据',ok:'用户数据正常',stale:'用户数据过期',error:'读取错误',stopped:'已停止'})[s.status]||'等待数据';
+  $('health').className='badge'+(ok?'': ' bad');$('age').textContent=s.data_age_s==null?'尚无有效用户数据':`距最近更新 ${s.data_age_s.toFixed(1)} 秒`;
+  $('simulation').hidden=!sim;$('scenario').textContent=`当前情境：${cases[d.scenario]||'—'}`;
+  $('count').textContent=s.user_count??'—';$('target').textContent=s.target_user_id??'—';
+  $('distance').textContent=s.distance_m==null?'未知':s.distance_m.toFixed(2);
+  $('zone').textContent=zones[s.zone]||'未知';$('tracking').textContent=tracking[s.tracking]||'';
+  $('raw').textContent=JSON.stringify(s,null,2);$('error').textContent=[s.error,d.camera_error].filter(Boolean).join('；');
+  $('viewTitle').textContent=sim?'模拟示意图（不是摄像头）':'机器人摄像头';
+  $('person').textContent=ok?(s.user_count||'无人'):'?';$('sceneText').textContent=ok?(zones[s.zone]||'未知'):'当前观察无效';
+  const cameraFresh=!sim&&d.frame_age_s!=null&&d.frame_age_s<3;
+  $('camera').hidden=!cameraFresh||!lastFrame;$('scene').hidden=cameraFresh&&!!lastFrame;
+  $('frameHint').textContent=sim?'此视图仅表示模拟状态，没有采集相机画面。':d.frame_age_s==null?'未收到画面。真实模式需加 --camera。':`最近画面 ${d.frame_age_s.toFixed(1)} 秒前${cameraFresh?'':'（已过期，隐藏旧画面）'}`;
+  $('suggestion').textContent=!ok?'感知不可用：暂停基于视觉的新决定。':s.tracking==='temporarily_lost'?'短暂等待目标恢复，暂不切换交谈者。':s.tracking==='confirming'?'先确认目标稳定出现。':s.zone==='far'?'可以作一次简短邀请；等待用户选择。':s.zone==='interaction'?'已处于交谈区；用户选择开始后才进入个人分享。':s.zone==='none'?'保持等待。':'距离未知：保留检测结果，暂不做远近适应。';
+  $('events').replaceChildren();const ev=(d.events||[]).slice().reverse();
+  if(!ev.length){const li=document.createElement('li');li.textContent='等待状态变化。';$('events').append(li);}
+  for(const e of ev){const li=document.createElement('li');li.textContent=`#${e.sequence} ${names[e.name]||e.name}${e.zone?' → '+zones[e.zone]:''}${e.user_id?' · '+e.user_id:''}`;$('events').append(li);}
+ }catch(e){offline();}
+ setTimeout(refresh,500);
+}
+async function frame(){if(fetchingFrame)return;fetchingFrame=true;try{const r=await fetch('/api/frame',{signal:AbortSignal.timeout(1800)});const d=await r.json();if(d.image&&d.image!==lastFrame){lastFrame=d.image;$('camera').src='data:image/jpeg;base64,'+lastFrame;}}catch{}finally{fetchingFrame=false;}}
+document.querySelectorAll('[data-case]').forEach(b=>b.addEventListener('click',async()=>{try{const r=await fetch('/simulate/'+b.dataset.case,{method:'POST'});if(!r.ok)throw Error();document.querySelectorAll('[data-case]').forEach(x=>x.classList.toggle('active',x===b));}catch{offline();}}));
+refresh();setInterval(frame,1000);
+</script>
+</html>
