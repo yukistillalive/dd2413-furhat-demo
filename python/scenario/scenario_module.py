@@ -9,9 +9,10 @@ is commented out in conversation/gemini_live_audio.py.
 
 Two lab behaviors:
   default  normal short chat, original face and voice, LED off
-  golem    calm solemn persona, male TTS voice, another face, slow gold light
+  golem    calm solemn persona, male TTS voice, the same face, slow gold light
 """
 import asyncio
+import math
 import re
 from dataclasses import dataclass, replace
 
@@ -39,14 +40,45 @@ class Scenario:
     # Used only by the parked Gemini Live audio path (gemini_live_audio.py).
     gemini_voice: str
     reverb_mix: float = 0.0
-    # None: restore the face that was active when the program started.
+    # None: keep the face that was active when the program started.
     face_id: str | None = None
-    face_keywords: tuple[str, ...] = ()
     # Empty: turn the LED off. Otherwise loop (hex color, seconds).
     led_frames: tuple[tuple[str, float], ...] = ()
     furhat_gender: str | None = None
     microexpressions: bool = True
     head_sway: bool = False
+
+
+def _srgb_to_linear(channel: int) -> float:
+    value = channel / 255.0
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def breathing_led(hex_color: str, period: float = 6.4, steps: int = 160, floor: float = 0.18) -> tuple[tuple[str, float], ...]:
+    """One slow breath of a screen color, remapped for Furhat's LED ring.
+
+    The wire format stays #RRGGBB. A light tint such as #D9B270 still has a
+    large blue byte, and this ring's blue is much stronger than a monitor's,
+    so those bytes come out cold white. The hue is kept, blue is reduced,
+    and the brightest channel stays under 100 so the color does not wash out.
+    Brightness follows a cosine in small steps, so the change stays continuous.
+    """
+    color = hex_color.lstrip("#")
+    linear = [_srgb_to_linear(int(color[i:i + 2], 16)) for i in (0, 2, 4)]
+    peak = max(linear) or 1.0
+    # Blue is scaled down: on this hardware it otherwise pulls the tint cool.
+    ratios = (linear[0] / peak, linear[1] / peak, linear[2] / peak * 0.35)
+    led_peak = 88
+    hold = period / steps
+    frames = []
+    for step in range(steps):
+        wave = 0.5 - 0.5 * math.cos(2 * math.pi * step / steps)
+        level = floor + (1.0 - floor) * wave
+        rgb = tuple(max(0, min(127, round(led_peak * ratio * level))) for ratio in ratios)
+        frames.append(("#{:02X}{:02X}{:02X}".format(*rgb), hold))
+    return tuple(frames)
 
 
 SCENARIOS = {
@@ -69,13 +101,7 @@ SCENARIOS = {
         enter_prompt="You have just taken on the Golem manner. Speak one short, calm sentence so the user hears the change. Then wait.",
         gemini_voice="Charon",
         reverb_mix=0.42,
-        face_keywords=("golem", "stone", "mask"),
-        led_frames=(
-            ("#3a2208", 0.55),
-            ("#8a6414", 0.7),
-            ("#f0d78c", 0.35),
-            ("#c9a227", 0.85),
-        ),
+        led_frames=breathing_led("#D9B270"),
         furhat_gender="male",
         microexpressions=False,
         head_sway=False,
@@ -242,7 +268,7 @@ class ScenarioManager:
             self._original_face_id = status.get("face_id")
             entries = _face_entries(status.get("face_list"))
             print("[scenario] available faces:", ", ".join(item["id"] for item in entries) or "(none)")
-        target = self._resolve_face(status)
+        target = self._resolve_face()
         event = {
             "type": "request.face.config",
             "visibility": True,
@@ -258,24 +284,12 @@ class ScenarioManager:
         except Exception as e:
             print(f"[scenario] face config failed: {e}")
 
-    def _resolve_face(self, status: dict) -> str | None:
-        if self.scenario.name != "golem":
-            return self.scenario.face_id or self._original_face_id
-        if self.golem_face_id:
+    def _resolve_face(self) -> str | None:
+        """Use only an explicitly configured face. Otherwise keep the startup face."""
+        if self.scenario.name == "golem" and self.golem_face_id:
             return self.golem_face_id
         if self.scenario.face_id:
             return self.scenario.face_id
-        entries = _face_entries(status.get("face_list"))
-        for item in entries:
-            label = item["label"].lower()
-            if any(keyword in label for keyword in self.scenario.face_keywords):
-                return item["id"]
-        original = (self._original_face_id or "").lower()
-        for item in entries:
-            if item["id"].lower() != original:
-                print(f"[scenario] no face matched {self.scenario.face_keywords}; using {item['id']}")
-                return item["id"]
-        print("[scenario] no alternate face installed; face stays as it is. Pass --golem-face ID.")
         return self._original_face_id
 
     def _restart_led(self):

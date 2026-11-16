@@ -3,6 +3,8 @@
     python main.py --host <ROBOT_IP> --auth_key <KEY>
 
     conversation/  Gemini text -> Furhat TTS; Live audio path is parked
+    store/         Conversation log       - SQLite transcript (--log-db)
+    debug_hub/     Debug hub              - live feed for ../debug-ui (--debug-ui)
     vision/        Vision Perception      - Furhat camera frames
     scenario/      Scenario Setting       - prompt -> WebSocket requests
     gui/           GUI component          - (not wired in yet)
@@ -10,19 +12,24 @@
 """
 import argparse
 import asyncio
+import os
 import signal
+from pathlib import Path
 
 from dotenv import load_dotenv
 from furhat_realtime_api import AsyncFurhatClient
 
 from conversation import RealtimeConversation
+from conversation.realtime_conversation import TEXT_MODEL
+from debug_hub import DebugHub, DEFAULT_PORT
 from scenario import ScenarioManager, SCENARIOS
+from store import ConversationLog
 from vision import VisionModule
+
+load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 
 async def main(args):
-    load_dotenv(override=True)
-
     furhat = AsyncFurhatClient(args.host, auth_key=args.auth_key)
     try:
         await furhat.connect()
@@ -42,14 +49,21 @@ async def main(args):
     scenario.bind(furhat)
     await scenario.apply()
 
-    # Realtime Conversation module
-    conversation = RealtimeConversation(furhat, scenario, model=args.model, debug=args.debug)
+    # Realtime Conversation module. The log and debug hub are optional.
+    log = ConversationLog(args.log_db) if args.log_db else None
+    hub = DebugHub(port=args.debug_ui_port) if args.debug_ui else None
+    if hub:
+        await hub.start()
+    conversation = RealtimeConversation(
+        furhat, scenario, model=args.model, debug=args.debug, log=log, hub=hub)
 
     # Vision Perception module, feeding frames into the conversation
     vision = None
     if not args.no_vision:
         vision = VisionModule(furhat, frame_interval=args.frame_interval, debug=args.debug)
         vision.add_frame_listener(conversation.send_video_frame)
+        if hub:
+            vision.add_frame_listener(hub.send_frame)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -78,6 +92,10 @@ async def main(args):
             except Exception:
                 pass
         await furhat.disconnect()
+        if hub:
+            await hub.stop()
+        if log:
+            log.close()
 
 
 async def _behavior_commands(scenario: ScenarioManager, conversation: RealtimeConversation):
@@ -108,13 +126,16 @@ async def _behavior_commands(scenario: ScenarioManager, conversation: RealtimeCo
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", type=str, default="127.0.0.1", help="Furhat robot IP address")
-    parser.add_argument("--auth_key", type=str, default=None, help="Authentication key for Realtime API")
-    parser.add_argument("--model", type=str, default="gemini-3.5-flash", help="Gemini text model ID")
+    parser.add_argument("--host", type=str, default=os.environ.get("FURHAT_HOST", "127.0.0.1"), help="Furhat robot IP address")
+    parser.add_argument("--auth_key", type=str, default=os.environ.get("FURHAT_AUTH_KEY") or None, help="Authentication key for Realtime API")
+    parser.add_argument("--model", type=str, default=TEXT_MODEL, help="Gemini text model. Default is TEXT_MODEL in realtime_conversation.py.")
     parser.add_argument("--scenario", type=str, choices=list(SCENARIOS), default=None, help="Starting behavior: default, golem, or vision")
     parser.add_argument("--golem-face", type=str, default=None, help="Exact Furhat face_id used by the golem behavior")
     parser.add_argument("--prompt", type=str, default=None, help="Custom system prompt, overrides --scenario")
     parser.add_argument("--no-vision", action="store_true", help="Run without the camera / vision module")
     parser.add_argument("--frame_interval", type=float, default=1.0, help="Seconds between camera frames sent to Gemini")
+    parser.add_argument("--log-db", type=str, default=None, help="SQLite file for the text transcript (e.g. conversations.db)")
+    parser.add_argument("--debug-ui", action="store_true", help="Stream camera and transcript to the debug-ui page on localhost")
+    parser.add_argument("--debug-ui-port", type=int, default=DEFAULT_PORT, help=f"Port for --debug-ui (default {DEFAULT_PORT})")
     parser.add_argument("--debug", action="store_true", help="Print debug info from the modules")
     asyncio.run(main(parser.parse_args()))

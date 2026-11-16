@@ -9,6 +9,8 @@ is not used. That code is commented out in gemini_live_audio.py.
 import asyncio
 import base64
 import os
+import re
+import time
 
 from google import genai
 from google.genai import errors, types
@@ -16,12 +18,35 @@ from furhat_realtime_api import AsyncFurhatClient, Events
 
 from scenario import ScenarioManager, behavior_command_phrases, match_behavior_command
 
-TEXT_MODEL = "gemini-3.5-flash"
+# gofast model that is still on the Gemini API. Override with --model.
+TEXT_MODEL = "gemini-3.8-flash-lite"
+# This key's 404 tells us to call gemini-3.5-flash-lite.
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+FILLER_WORDS = {
+    "um", "uh", "uhh", "hmm", "hm", "ah", "er", "yeah", "yep", "yes", "no", "nah",
+    "ok", "okay", "for", "during", "the", "a", "an", "and", "to", "of", "it", "i",
+    "oh", "well", "like", "so", "just", "that",
+}
+GREETINGS = {"hello", "hi", "hey", "help", "thanks", "thank"}
+
+
+def is_valid_user_turn(text: str) -> bool:
+    """True when the utterance is enough of a question or statement to spend an API call."""
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    content = [word for word in words if word not in FILLER_WORDS]
+    if not content:
+        return False
+    if len(content) >= 3:
+        return True
+    if len(content) >= 2 and sum(len(word) for word in content) >= 8:
+        return True
+    return len(content) == 1 and content[0] in GREETINGS
 
 
 class RealtimeConversation:
     def __init__(self, furhat: AsyncFurhatClient, scenario: ScenarioManager,
-                 model: str = TEXT_MODEL, api_key: str | None = None, debug: bool = False):
+                 model: str = TEXT_MODEL, api_key: str | None = None, debug: bool = False,
+                 log=None, hub=None):
         api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment or .env")
@@ -32,6 +57,8 @@ class RealtimeConversation:
             print(f"[conversation] {self.model} generates audio. Text route uses {TEXT_MODEL}.")
             self.model = TEXT_MODEL
         self.debug = debug
+        self.log = log
+        self.hub = hub
         self.client = genai.Client(api_key=api_key)
         self.history: list[types.Content] = []
         self.latest_frame: str | None = None
@@ -39,6 +66,8 @@ class RealtimeConversation:
         self.behavior_changed = asyncio.Event()
         self.shutting_down = False
         self._listen_future: asyncio.Future | None = None
+        self._backoff_until = 0.0
+        print(f"[conversation] Gemini model: {self.model}")
 
     async def stop(self):
         if self.shutting_down:
@@ -61,30 +90,49 @@ class RealtimeConversation:
             print("[conversation] stored camera frame, length", len(image_b64 or ""))
 
     async def run(self):
-        await self.furhat.request_attend_user()
-        await self.furhat.request_listen_config(
-            languages=["en-US"],
-            phrases=behavior_command_phrases(),
-        )
-        await self._speak_cue(switched=False)
-        while not self.stop_event.is_set():
-            if self.behavior_changed.is_set():
-                self.behavior_changed.clear()
-                await self._speak_cue(switched=True)
-                continue
-            heard = await self._listen_once()
-            if self.stop_event.is_set():
-                break
-            if self.behavior_changed.is_set() or not heard.strip():
-                continue
-            print("User:", heard)
-            command = match_behavior_command(heard)
-            if command:
-                await self._switch_from_voice(command)
-                continue
-            reply = await self._complete(heard)
-            if reply and not self.behavior_changed.is_set():
-                await self._speak(reply)
+        if self.log:
+            await self.log.start_session(
+                self.model, self.scenario.scenario.name, self.scenario.instruction_text())
+        try:
+            await self.furhat.request_attend_user()
+            await self.furhat.request_listen_config(
+                languages=["en-US"],
+                phrases=behavior_command_phrases(),
+            )
+            await self._speak_cue(switched=False)
+            await self._set_state("listening")
+            while not self.stop_event.is_set():
+                if self.behavior_changed.is_set():
+                    self.behavior_changed.clear()
+                    await self._log_event("behavior", self.scenario.scenario.name)
+                    await self._speak_cue(switched=True)
+                    continue
+                heard = await self._listen_once()
+                if self.stop_event.is_set():
+                    break
+                if self.behavior_changed.is_set() or not heard.strip():
+                    continue
+                print("User:", heard)
+                await self._log_message("user", heard)
+                command = match_behavior_command(heard)
+                if command:
+                    await self._switch_from_voice(command)
+                    continue
+                if not is_valid_user_turn(heard):
+                    print("[conversation] skipped Gemini call: no complete question")
+                    await self._log_event("skipped", heard)
+                    continue
+                if time.monotonic() < self._backoff_until:
+                    print("[conversation] skipped Gemini call: rate-limit pause")
+                    await self._log_event("rate_limit", "paused")
+                    continue
+                reply = await self._complete(heard)
+                if reply and not self.behavior_changed.is_set():
+                    await self._speak(reply)
+        finally:
+            await self._set_state("stopped")
+            if self.log:
+                await self.log.end_session()
 
     async def _switch_from_voice(self, name: str):
         try:
@@ -120,19 +168,39 @@ class RealtimeConversation:
 
     async def _generate(self, contents: list[types.Content], remember: bool) -> str:
         del remember
+        if time.monotonic() < self._backoff_until:
+            return ""
+        config = types.GenerateContentConfig(
+            system_instruction=self.scenario.instruction_text(),
+            max_output_tokens=80,
+        )
+        if self.model.startswith("gemini-2.5"):
+            config.thinking_config = types.ThinkingConfig(thinking_budget=0)
         try:
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.model,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=self.scenario.instruction_text(),
-                    max_output_tokens=256,
-                ),
+                config=config,
             )
         except errors.APIError as e:
+            message = str(e)
+            normalized = message.lower().replace("_", " ")
+            if self.model != FALLBACK_MODEL and any(
+                token in normalized for token in ("not found", "not supported", "no longer available", "unavailable")
+            ):
+                print(f"[conversation] {self.model} unavailable, switching to {FALLBACK_MODEL}")
+                self.model = FALLBACK_MODEL
+                await self._log_event("model", self.model)
+                return await self._generate(contents, False)
+            if "429" in message or "TooManyRequests" in message:
+                self._backoff_until = time.monotonic() + 30
+                print("[conversation] Gemini rate limit. No further requests for 30 seconds.")
+                await self._log_event("rate_limit", message)
+                return ""
             print(f"[conversation] Gemini error: {e}")
-            return "Sorry, I had trouble thinking just now. Could you repeat that?"
+            await self._log_event("gemini_error", message)
+            return ""
         text = (getattr(response, "text", None) or "").strip()
         if self.debug:
             print("[conversation] Gemini text:", text)
@@ -142,11 +210,49 @@ class RealtimeConversation:
 
     async def _speak(self, text: str):
         print("Robot:", text)
+        await self._set_state("speaking")
         try:
             await self.furhat.request_speak_text(text, abort=True, wait=True)
         except Exception as e:
+            await self._log_event("tts_failed", str(e))
+            await self._set_state("listening")
             if not self.shutting_down:
                 print(f"[conversation] Furhat TTS failed: {e}")
+            return
+        await self._log_message("robot", text)
+        await self._set_state("listening")
+
+    async def _emit(self, **obj):
+        if not self.hub:
+            return
+        try:
+            await self.hub.emit(obj)
+        except Exception as e:
+            print("[conversation] debug hub error:", e)
+
+    async def _set_state(self, state: str):
+        await self._emit(type="state", state=state)
+
+    async def _log_message(self, role: str, text: str, interrupted: bool = False):
+        text = (text or "").strip()
+        if not text:
+            return
+        await self._emit(type="message", role=role, text=text, interrupted=interrupted)
+        if not self.log:
+            return
+        try:
+            await self.log.log_message(role, text, interrupted)
+        except Exception as e:
+            print("[conversation] log error:", e)
+
+    async def _log_event(self, type_: str, detail: str = ""):
+        await self._emit(type="event", name=type_, detail=detail)
+        if not self.log:
+            return
+        try:
+            await self.log.log_event(type_, detail)
+        except Exception as e:
+            print("[conversation] log error:", e)
 
     async def _listen_once(self) -> str:
         loop = asyncio.get_running_loop()
@@ -170,7 +276,7 @@ class RealtimeConversation:
                 stop_robot_start=True,
                 stop_user_end=True,
                 no_speech_timeout=8.0,
-                end_speech_timeout=1.0,
+                end_speech_timeout=1.8,
             )
             return await asyncio.wait_for(future, timeout=40.0)
         except asyncio.TimeoutError:
