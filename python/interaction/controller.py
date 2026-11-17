@@ -9,10 +9,16 @@ states and tells the behaviour layers what to do:
                one slow line asking them to come closer (max 2, 10 s apart).
     AWAKE      someone is in the interaction zone. awaken(), "warm", an opening
                line about one visible clothing item, then normal conversation.
+    RESTING    the visitor stayed silent (~20 s): the conversation said farewell
+               and ended. Asleep like DORMANT, but this visitor is still there, so
+               the far zone does not summon. Stepping out of the interaction zone
+               and back in wakes the Golem again with a short "you have returned".
 
     DORMANT --far >= 1.5 s--> SUMMONING --interaction zone--> AWAKE
     DORMANT --interaction zone (no far wait)----------------> AWAKE
-    SUMMONING / AWAKE --person_left, nobody back within 5 s--> DORMANT
+    AWAKE --silence farewell (conversation.on_rest)---------> RESTING
+    RESTING --far zone, then interaction zone again---------> AWAKE
+    SUMMONING / AWAKE / RESTING --person_left, nobody back within 5 s--> DORMANT
 
 Same-visitor rule: person_left does not put the Golem to sleep at once. It
 waits 5 s; if someone is confirmed in that window they are the same visitor
@@ -28,7 +34,7 @@ import time
 
 from gui.expressions import perform
 
-DORMANT, SUMMONING, AWAKE = "DORMANT", "SUMMONING", "AWAKE"
+DORMANT, SUMMONING, AWAKE, RESTING = "DORMANT", "SUMMONING", "AWAKE", "RESTING"
 
 SUMMON_LINES = (
     "Traveller... come closer. The Golem stirs.",
@@ -44,6 +50,7 @@ OPENING_CUE = (
     "End by inviting them to ask you something."
 )
 FALLBACK_GREETING = "I am awake... Welcome, traveller. Ask, and I shall answer."
+RETURN_LINE = "You have returned, traveller... Ask, and I shall answer."
 DORMANT_LED = "#140802"   # very dim ember while asleep or half-awake
 
 
@@ -80,6 +87,8 @@ class InteractionController:
         self._left_at: float | None = None
         self._left_visitor: Visitor | None = None   # set only during the grace window
         self._visitor_close: bool | None = None     # last value sent to conversation.set_visitor_close
+        self._stepped_back = False   # RESTING: the visitor has been in the far zone since resting
+        conversation.on_rest = self.rest
         self._task: asyncio.Task | None = None
 
     # ---- lifecycle ----
@@ -146,7 +155,20 @@ class InteractionController:
                 visitor.last_summon_at = now
                 self.log(f"[interaction] summon {index + 1}/{self.config.max_summons}")
                 self._launch(self._act_summon_line, index)
-        # AWAKE: only person_left ends it (handled in _handle_events)
+        elif self.state == RESTING:
+            # Never summon here: this visitor already talked. Wake only after they
+            # step out of the interaction zone (> exit distance) and come back in.
+            if zone == "far" and not self._stepped_back:
+                self._stepped_back = True
+                self.log("[interaction] resting visitor stepped back")
+            elif zone == "interaction" and self._stepped_back:
+                self._go(AWAKE, "came back after stepping out", now)
+        # AWAKE: only person_left (or the silence farewell, see rest()) ends it
+
+    def rest(self):
+        """conversation.on_rest: the silent visitor got the farewell, the session has ended."""
+        if self.state == AWAKE:
+            self._go(RESTING, "visitor silent after the prompt", self.clock())
 
     def _handle_events(self, events: list, now: float):
         if events and max(e.get("sequence", 0) for e in events) < self._last_seq:
@@ -206,9 +228,12 @@ class InteractionController:
                 visitor.summons = 1
                 visitor.last_summon_at = now
             self._launch(self._act_summoning, speak)
+        elif new_state == RESTING:
+            self._stepped_back = False
+            self._launch(self._act_resting)
         elif new_state == AWAKE:
             visitor.greeted = True
-            self._launch(self._act_awake)
+            self._launch(self._act_awake, old == RESTING)
 
     def _launch(self, action, *args):
         """Run one robot action after cancelling the previous one."""
@@ -247,13 +272,23 @@ class InteractionController:
         self.log(f"Robot (summon): {line}")
         await self.furhat.request_speak_text(line, abort=True, wait=True)
 
-    async def _act_awake(self):
+    async def _act_resting(self):
+        # The conversation already spoke the farewell and ended; end_session() is a no-op then.
+        await self.conversation.end_session()
+        await self.gui.golem.sleep()
+        await self.scenario.hold_led(DORMANT_LED)
+
+    async def _act_awake(self, returning: bool = False):
         await self._quietly(self.furhat.request_speak_stop())
         await self.scenario.release_led()
         await self.gui.golem.awaken()
         await self.gui.face.gaze_user()
         await perform(self.gui.face, "warm")
-        self.conversation.start_session(OPENING_CUE, FALLBACK_GREETING)
+        if returning:
+            # Same visitor woke a resting Golem: short fixed line, no clothing, keep the history.
+            self.conversation.start_session(None, RETURN_LINE, keep_history=True)
+        else:
+            self.conversation.start_session(OPENING_CUE, FALLBACK_GREETING)
 
     async def _quietly(self, coro):
         try:

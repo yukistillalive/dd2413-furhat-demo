@@ -39,6 +39,8 @@ FILLER_LINE = "Hmm... let me consider."
 NO_SPEECH_TIMEOUT_S = 5.0
 SILENCE_S = 9.0
 SILENCE_PROMPT = "Do you have a question for me, traveller?"
+SILENCE_FAREWELL = ("If you have no questions, I shall return to my slumber. "
+                    "Step closer again, and I will wake.")
 
 
 def is_valid_user_turn(text: str) -> bool:
@@ -91,9 +93,12 @@ class RealtimeConversation:
         self.filler_delay_s = FILLER_DELAY_S
         self._filler_started = False
         # Silence in a session (wait_for_session only): when the current silence began,
-        # and 0 = nothing done yet, 1 = prompted once, 2 = waiting quietly in "serene".
+        # and 0 = nothing done yet, 1 = prompted once (the next silence ends the session).
         self._silent_since: float | None = None
         self._silence_stage = 0
+        # Called (no arguments) after the silence farewell has ended the session.
+        # The interaction controller sets it and puts the Golem to rest.
+        self.on_rest = None
         # The interaction controller clears this when the visitor is no longer in the
         # interaction zone (walking off, person_left grace): no silence prompts then.
         self._visitor_close = True
@@ -115,13 +120,16 @@ class RealtimeConversation:
 
     # ---- Session hooks for the interaction controller ----
 
-    def start_session(self, opening_cue: str | None, fallback_line: str, resume: bool = False):
+    def start_session(self, opening_cue: str | None, fallback_line: str, resume: bool = False,
+                      keep_history: bool = False):
         """Start talking with a visitor.
 
         New visitor: forget the old history, speak an opening generated from
         opening_cue plus the latest camera frame (fallback_line if that fails),
-        then listen. resume=True: same visitor came back, so keep the history and
-        go straight to listening without an opening line.
+        then listen. With opening_cue None, fallback_line is spoken as is.
+        resume=True: same visitor came back, so keep the history and go straight
+        to listening without an opening line. keep_history=True: keep the history
+        but still speak the opening (a resting Golem woken by the same visitor).
         """
         self._session_id += 1
         self._session_active = True
@@ -129,11 +137,12 @@ class RealtimeConversation:
         self._silent_since = None
         self._silence_stage = 0
         if self.gui:
-            self.gui.idle.mode = "listening"   # drop a "quiet"/"thinking" mode left from the last visitor
+            self.gui.idle.mode = "listening"   # drop a "thinking" mode left from the last session
         if resume:
             self._opening = None
         else:
-            self.history = []
+            if not keep_history:
+                self.history = []
             self._opening = (opening_cue or "", fallback_line)
         self._session_wake.set()
 
@@ -349,7 +358,11 @@ class RealtimeConversation:
             await self.gui.idle.on_user_turn_start()
 
     async def _on_silence(self, session_id: int):
-        """Empty listen in a session: prompt once after ~10 s, then wait quietly in "serene"."""
+        """Empty listen in a session: prompt once after ~10 s; ~10 s later say farewell and rest.
+
+        Silence is counted only while listening (never while speaking or waiting for
+        Gemini: every spoken line restarts it) and only while the visitor is close.
+        """
         if not self._visitor_close:
             self._silent_since = None   # nobody in front of the robot: nothing to prompt
             return
@@ -364,10 +377,16 @@ class RealtimeConversation:
             await self._speak(SILENCE_PROMPT)   # restarts the silence timer
         elif self._silence_stage == 1:
             self._silence_stage = 2
-            print("[conversation] visitor still silent, waiting quietly")
-            await self._log_event("silence", "quiet")
-            if self.gui and self._in_session(session_id):
-                await self.gui.idle.on_quiet_wait()
+            print("[conversation] visitor still silent, farewell and rest")
+            await self._log_event("silence", "farewell")
+            self.history.append(types.Content(role="model", parts=[types.Part(text=SILENCE_FAREWELL)]))
+            self._trim_history()
+            await self._speak(SILENCE_FAREWELL)
+            if not self._in_session(session_id):
+                return   # the visitor left while the farewell was spoken; the controller decides
+            await self.end_session()
+            if self.on_rest:
+                self.on_rest()
 
     async def _perform_reply(self, raw: str) -> str:
         """Show the reply's emotion on the face. Return only the sentence that should be spoken."""

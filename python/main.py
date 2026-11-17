@@ -86,7 +86,7 @@ async def main(args):
         if hub:
             vision.add_frame_listener(hub.send_frame)
 
-    # Interaction controller: perception state -> DORMANT / SUMMONING / AWAKE
+    # Interaction controller: perception state -> DORMANT / SUMMONING / AWAKE / RESTING
     controller = None
     if args.interaction:
         controller = InteractionController(furhat, gui, conversation, scenario)

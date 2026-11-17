@@ -18,7 +18,7 @@ class IdleBehaviour:
     def __init__(self, face: GolemFace, golem: Golem):
         self.face = face
         self.golem = golem
-        self.mode = "listening"   # "listening" | "speaking" | "thinking" | "quiet"
+        self.mode = "listening"   # "listening" | "speaking" | "thinking"
         # True while a filler line ("Hmm...") is spoken during the model wait:
         # that speech must not end the thinking mode.
         self.filler_speaking = False
@@ -60,7 +60,7 @@ class IdleBehaviour:
         self.mode = "listening"
 
     async def on_user_turn_start(self):
-        """The visitor spoke: listen to them (and leave the quiet "serene" wait)."""
+        """The visitor spoke: look at them (and release a held "serene" face)."""
         self.mode = "listening"
         if self.golem.awake:
             if self.face.expression == "serene":
@@ -81,12 +81,6 @@ class IdleBehaviour:
         self.mode = "listening"
         if self.face.expression == "thinking" and self.golem.awake:
             await perform(self.face, "neutral")
-
-    async def on_quiet_wait(self):
-        """Visitor stays silent after a prompt: wait calmly, no glances, until they speak or leave."""
-        self.mode = "quiet"
-        if self.golem.awake:
-            await perform(self.face, "serene")
 
     # ---- Background loop ----
 
