@@ -8,7 +8,6 @@ is not used. That code is commented out in gemini_live_audio.py.
 """
 import asyncio
 import base64
-import json
 import os
 import re
 import time
@@ -17,6 +16,7 @@ from google import genai
 from google.genai import errors, types
 from furhat_realtime_api import AsyncFurhatClient, Events
 
+from gui.expressions import perform
 from scenario import ScenarioManager, behavior_command_phrases, match_behavior_command, parse_model_reply
 
 # gofast model that is still on the Gemini API. Override with --model.
@@ -47,7 +47,7 @@ def is_valid_user_turn(text: str) -> bool:
 class RealtimeConversation:
     def __init__(self, furhat: AsyncFurhatClient, scenario: ScenarioManager,
                  model: str = TEXT_MODEL, api_key: str | None = None, debug: bool = False,
-                 log=None, hub=None):
+                 log=None, hub=None, gui=None):
         api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment or .env")
@@ -60,6 +60,8 @@ class RealtimeConversation:
         self.debug = debug
         self.log = log
         self.hub = hub
+        # GolemGUI (--gui): the reply's emotion label is performed on the face.
+        self.gui = gui
         self.client = genai.Client(api_key=api_key)
         self.history: list[types.Content] = []
         self.latest_frame: str | None = None
@@ -173,27 +175,18 @@ class RealtimeConversation:
         return say
 
     async def _perform_reply(self, raw: str) -> str:
-        """Run appearance requests. Return only the sentence that should be spoken."""
+        """Show the reply's emotion on the face. Return only the sentence that should be spoken."""
         reply = parse_model_reply(raw)
-        for event in reply.requests:
-            if self.stop_event.is_set():
-                break
-            await self._send_appearance(event)
-        if not reply.say and not reply.requests and re.search(r"request\.|^\s*[\[{]", raw):
+        if not reply.say and re.search(r"request\.|^\s*[\[{]", raw):
             print("[conversation] withheld reply that looked like a request")
-            await self._log_event("appearance", "reply withheld: invalid request")
+            await self._log_event("appearance", "reply withheld: invalid reply")
+        if reply.say and self.gui and self.gui.golem.awake and not self.stop_event.is_set():
+            try:
+                label = await perform(self.gui.face, reply.emotion)
+                await self._log_event("emotion", label)
+            except Exception as e:
+                print(f"[conversation] expression failed: {e}")
         return reply.say
-
-    async def _send_appearance(self, event: dict):
-        try:
-            if event["type"] == "request.led.set":
-                await self.scenario.stop_led_loop()
-            await self.furhat.send_event(event)
-            print("[conversation] appearance:", event["type"], {k: v for k, v in event.items() if k != "type"})
-            await self._log_event("appearance", json.dumps(event, ensure_ascii=False))
-        except Exception as e:
-            print(f"[conversation] appearance request failed: {e}")
-            await self._log_event("appearance_failed", str(e))
 
     async def _generate(self, contents: list[types.Content], remember: bool, use_json: bool = True) -> str:
         del remember

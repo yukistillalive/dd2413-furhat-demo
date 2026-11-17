@@ -62,7 +62,7 @@ async def main(args):
     if hub:
         await hub.start()
     conversation = RealtimeConversation(
-        furhat, scenario, model=args.model, debug=args.debug, log=log, hub=hub)
+        furhat, scenario, model=args.model, debug=args.debug, log=log, hub=hub, gui=gui)
 
     # Vision Perception module, feeding frames into the conversation
     vision = None
