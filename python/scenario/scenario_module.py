@@ -278,6 +278,10 @@ class ScenarioManager:
             raise ValueError("Refusing to send an empty cue")
         return text.strip() + " Put the spoken line in say and choose one emotion."
 
+    def with_reply_reminder(self, cue: str) -> str:
+        """Any extra cue (e.g. the interaction opening) with the same reply-format reminder."""
+        return cue.strip() + " Put the spoken line in say and choose one emotion."
+
     async def switch(self, name: str) -> bool:
         """Change behavior. Returns False if that behavior is already active."""
         if name not in BEHAVIORS:
