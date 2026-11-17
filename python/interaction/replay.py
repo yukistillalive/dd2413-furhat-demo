@@ -9,7 +9,9 @@ From the python/ folder:
 What is real here: PerceptionTracker (vision/), InteractionController,
 GolemGUI face/golem code and ScenarioManager LED logic. What is fake: the
 Furhat client (it prints what the robot would do), the conversation (it
-prints start/end), and time (a simulated clock, so a 40 s segment runs at once).
+prints start/end; in the rest_* segments the visitor stays silent, so after
+20 s close to the robot it says farewell and the Golem rests), and time (a
+simulated clock, so a 40 s segment runs at once).
 """
 import argparse
 import asyncio
@@ -19,7 +21,7 @@ from pathlib import Path
 from furhat_realtime_api import Events
 
 from gui import GolemGUI
-from interaction.controller import AWAKE, DORMANT, SUMMONING, InteractionController
+from interaction.controller import AWAKE, DORMANT, RESTING, SUMMONING, InteractionController
 from scenario import SCENARIOS, ScenarioManager
 from vision.perception_state import PerceptionConfig, PerceptionTracker
 
@@ -121,23 +123,49 @@ class FakeFurhat:
 
 
 class FakeConversation:
-    def __init__(self, clock, out):
+    """rest_after: the visitor never speaks, so after that many seconds close to the
+    robot the conversation says its farewell, ends and calls on_rest (like the real one)."""
+
+    def __init__(self, clock, out, rest_after=None):
         self.clock = clock
         self.out = out
         self.active = False
-        self.starts = []   # resume flags, one per start_session
+        self.starts = []   # "greeting" | "resume" | "return", one per start_session
         self.ends = 0
+        self.rests = 0
         self.latest_frame = None
         self.close = []   # (time, close) from set_visitor_close
+        self.on_rest = None   # set by InteractionController
+        self.rest_after = rest_after
+        self._close = True
+        self._quiet_from = 0.0
 
     def set_visitor_close(self, close):
         self.close.append((self.clock(), close))
+        self._close = close
+        if close:
+            self._quiet_from = self.clock()
 
-    def start_session(self, opening_cue, fallback_line, resume=False):
+    def start_session(self, opening_cue, fallback_line, resume=False, keep_history=False):
         self.active = True
-        self.starts.append(resume)
-        what = "resume, no greeting" if resume else "opening line (frame + clothing cue), then Q&A"
+        kind = "resume" if resume else "return" if keep_history else "greeting"
+        self.starts.append(kind)
+        self._quiet_from = self.clock()
+        what = {"resume": "resume, no greeting",
+                "return": f'returning visitor: "{fallback_line}"',
+                "greeting": "opening line (frame + clothing cue), then Q&A"}[kind]
         self.out(f"  {self.clock():6.2f}s   conversation: START ({what})")
+
+    def tick(self):
+        if not (self.active and self.rest_after and self._close):
+            return
+        if self.clock() - self._quiet_from >= self.rest_after:
+            self.out(f"  {self.clock():6.2f}s   conversation: visitor silent -> prompt, farewell, END")
+            self.active = False
+            self.ends += 1
+            self.rests += 1
+            if self.on_rest:
+                self.on_rest()
 
     async def end_session(self):
         if self.active:
@@ -209,6 +237,22 @@ def synthetic_segments():
         ),
         # perception errors while AWAKE must not change the state
         "stale": _segment((2.0, 30.0, "user-5", 1.0), (30.0, 40.0, None, None)),
+        # silent visitor: farewell -> RESTING; steps back to 1.8 m and returns -> AWAKE again
+        "rest_return": _segment(
+            (2.0, 30.0, "user-2", 1.0),
+            (30.0, 34.0, "user-2", 1.8),
+            (34.0, 44.0, "user-2", 1.0),
+            (44.0, 56.0, None, None),
+        ),
+        # silent visitor rests, waits far away (no summoning), leaves -> DORMANT;
+        # a new visitor in the far zone then gets the summon flow
+        "rest_leave": _segment(
+            (2.0, 30.0, "user-2", 1.0),
+            (30.0, 46.0, "user-2", 2.5),
+            (46.0, 56.0, None, None),
+            (56.0, 66.0, "user-8", 2.5),
+            (66.0, 80.0, None, None),
+        ),
     }
 
 
@@ -222,16 +266,21 @@ EXPECTED = {
     "same_visitor": dict(transitions=[(DORMANT, AWAKE), (AWAKE, DORMANT), (DORMANT, AWAKE), (AWAKE, DORMANT)],
                          summons=0, greetings=2, resumes=0, sleeps=3),
     "stale": dict(transitions=[(DORMANT, AWAKE), (AWAKE, DORMANT)], summons=0, greetings=1),
+    "rest_return": dict(transitions=[(DORMANT, AWAKE), (AWAKE, RESTING), (RESTING, AWAKE), (AWAKE, DORMANT)],
+                        summons=0, greetings=1, returns=1, rests=1),
+    "rest_leave": dict(transitions=[(DORMANT, AWAKE), (AWAKE, RESTING), (RESTING, DORMANT),
+                                    (DORMANT, SUMMONING), (SUMMONING, DORMANT)],
+                       summons=1, greetings=1, returns=0, rests=1),
 }
 
 
 # ---- replay ----
 
-async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=None):
+async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=None, rest_after=None):
     """Feed samples through tracker + controller. Returns a result dict."""
     clock = SimClock()
     furhat = FakeFurhat(clock, out)
-    conversation = FakeConversation(clock, out)
+    conversation = FakeConversation(clock, out, rest_after=rest_after)
     scenario = ScenarioManager("golem")
     scenario.bind(furhat)
     scenario.builtin_blinking = False
@@ -266,6 +315,7 @@ async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=No
         state = tracker.tick()
         state["events"] = list(tracker.events)
         await controller.on_state(state)
+        conversation.tick()
         await _settle(controller)
         step += 1
 
@@ -277,8 +327,10 @@ async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=No
         transition_times=[(t, a, b) for t, a, b, _ in controller.transitions],
         close=conversation.close,
         summons=len(spoken),
-        greetings=conversation.starts.count(False),
-        resumes=conversation.starts.count(True),
+        greetings=conversation.starts.count("greeting"),
+        resumes=conversation.starts.count("resume"),
+        returns=conversation.starts.count("return"),
+        rests=conversation.rests,
         final=controller.state,
         sleeps=sum(1 for _, call, kw in furhat.calls if call == "gesture" and kw.get("name") == "CloseEyes"),
     )
@@ -312,17 +364,19 @@ async def run_all(only=None, file=RECORDING, enter=1.2, exit_=1.5, out=print):
     for name, (samples, error_window) in segments.items():
         if only and name != only:
             continue
-        results[name] = await replay(name, samples, enter, exit_, out, error_window)
+        rest_after = 20.0 if name.startswith("rest") else None
+        results[name] = await replay(name, samples, enter, exit_, out, error_window, rest_after)
         r = results[name]
         out(f"  -> transitions: {' | '.join(f'{a}->{b}' for a, b in r['transitions']) or 'none'}")
-        out(f"  -> summon lines: {r['summons']}, greetings: {r['greetings']}, resumes: {r['resumes']}")
+        out(f"  -> summon lines: {r['summons']}, greetings: {r['greetings']}, resumes: {r['resumes']},"
+            f" returns: {r['returns']}, rests: {r['rests']}")
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--file", default=str(RECORDING), help="users_recording.jsonl to replay")
-    parser.add_argument("--only", default=None, help="recording, approach, walk_in, same_visitor or stale")
+    parser.add_argument("--only", default=None, help="recording, approach, walk_in, same_visitor, stale, rest_return or rest_leave")
     parser.add_argument("--enter-distance", type=float, default=1.2)
     parser.add_argument("--exit-distance", type=float, default=1.5)
     parser.add_argument("--check", action="store_true", help="compare with the expected transitions")

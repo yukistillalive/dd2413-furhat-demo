@@ -5,7 +5,9 @@ From the python/ folder, with the Furhat SDK running locally:
     python -m interaction.sdk_demo --host 127.0.0.1 --scripted   # no Gemini, fixed replies
 
 Scripted visitor: nobody -> stands far away (2.5 m) -> walks to 1.0 m and stops ->
-says a few lines -> walks away and disappears.
+asks one question -> stays silent (prompt, then farewell: the Golem rests) ->
+steps back to 2 m and returns (the Golem wakes: "You have returned") -> asks,
+says goodbye -> walks away and disappears.
 
 Real code: AsyncFurhatClient (the SDK virtual robot), ScenarioManager (golem),
 GolemGUI, PerceptionTracker, InteractionController, RealtimeConversation (Gemini
@@ -33,7 +35,10 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 # None = the visitor stays silent for one turn: the robot really listens (and hears nothing).
 VISITOR_LINES = [
     "Hello. Who are you?",
-    None, None, None, None, None,     # ~25 s of silence: one prompt, then the quiet "serene" wait
+    None, None, None, None,     # ~20 s of silence: prompt after ~10 s, farewell after ~20 s
+]
+# After stepping back and returning to the resting Golem
+RETURN_LINES = [
     "What are you guarding here?",
     "Thank you. Goodbye!",
 ]
@@ -81,7 +86,8 @@ def trace_robot(furhat):
 class Visitor:
     """Where the fake person is. distance None = not seen by the robot."""
 
-    def __init__(self):
+    def __init__(self, controller=None):
+        self.controller = controller
         self.distance = None
         self.user_id = "user-1"
         self.lines = list(VISITOR_LINES)
@@ -107,6 +113,15 @@ class Visitor:
         log("visitor: walks closer 2.5 m -> 1.0 m")
         await self.walk(2.5, 1.0, 3)
         log("visitor: stops at 1.0 m")
+        while self.controller.state != "RESTING":
+            await asyncio.sleep(0.2)
+        await asyncio.sleep(3)
+        log("visitor: steps back 1.0 m -> 2.0 m (out of the interaction zone)")
+        self.lines = list(RETURN_LINES)
+        await self.walk(1.0, 2.0, 2)
+        await asyncio.sleep(3)
+        log("visitor: comes back 2.0 m -> 1.0 m")
+        await self.walk(2.0, 1.0, 2)
         await self.done_talking.wait()
         await asyncio.sleep(2)
         log("visitor: walks away 1.0 m -> 2.5 m")
@@ -184,6 +199,7 @@ async def main(args):
                                     visitor=visitor, scripted=args.scripted)
     controller = InteractionController(furhat, gui, conversation, scenario,
                                        log=lambda text: log(text))
+    visitor.controller = controller
     tracker = PerceptionTracker(PerceptionConfig(enter_distance_m=1.2, exit_distance_m=1.5,
                                                  distance_unit="m"))
     await controller.start()
