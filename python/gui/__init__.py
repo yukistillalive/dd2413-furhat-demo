@@ -18,8 +18,12 @@ class GolemGUI:
         self.tools = GolemTools(self.golem)
         self.panel = None
 
-    async def start(self, panel_port: int | None = None):
-        await self.golem.awaken()
+    async def start(self, panel_port: int | None = None, awake: bool = True):
+        """awake=False starts dormant (eyes closed), e.g. when the interaction controller decides."""
+        if awake:
+            await self.golem.awaken()
+        else:
+            await self.golem.sleep()
         self.idle.start()
         if panel_port:
             self.panel = ControlPanel(self)
