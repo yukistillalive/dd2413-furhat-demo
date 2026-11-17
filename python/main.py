@@ -8,6 +8,7 @@
     vision/        Vision Perception      - Furhat camera frames
     scenario/      Scenario Setting       - prompt -> WebSocket requests
     gui/           Golem behaviour layer  - face, gaze, LED, idle, tools, debug panel (--gui)
+    interaction/   Interaction controller - visitor distance -> DORMANT/SUMMONING/AWAKE (--interaction)
     demos/         the original standalone examples
 """
 import argparse
@@ -23,9 +24,11 @@ from conversation import RealtimeConversation
 from conversation.realtime_conversation import TEXT_MODEL
 from debug_hub import DebugHub, DEFAULT_PORT
 from gui import GolemGUI
+from interaction import InteractionController
 from scenario import ScenarioManager, SCENARIOS
 from store import ConversationLog
 from vision import VisionModule
+from vision.perception_state import PerceptionConfig
 
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
@@ -40,12 +43,6 @@ async def main(args):
 
     # Scenario Setting module. Camera-on does not replace the chatbot persona;
     # it only adds a vision sentence inside the active behavior's prompt.
-    # Golem behaviour layer + debug panel (see gui/INTEGRATION.md for the conversation hookup)
-    gui = GolemGUI(furhat) if args.gui else None
-    if gui:
-        await gui.start(panel_port=args.gui_port)
-
-    # Scenario Setting module
     if args.prompt:
         scenario = ScenarioManager.from_prompt(args.prompt)
         scenario.golem_face_id = args.golem_face
@@ -54,7 +51,18 @@ async def main(args):
         scenario = ScenarioManager(name, golem_face_id=args.golem_face)
     scenario.use_vision = not args.no_vision
     scenario.bind(furhat)
+
+    # Golem behaviour layer + debug panel (see gui/INTEGRATION.md)
+    gui = GolemGUI(furhat) if args.gui else None
+    if gui:
+        # One LED owner: while the behavior has an LED pattern (golem breathing), the
+        # scenario owns the LED and GUI expressions leave it alone.
+        gui.face.led_allowed = lambda: not scenario.owns_led()
+        # Only the GUI idle layer blinks; Furhat's built-in blinking is switched off.
+        scenario.builtin_blinking = False
     await scenario.apply()
+    if gui:
+        await gui.start(panel_port=args.gui_port, awake=not args.interaction)
 
     # Realtime Conversation module. The log and debug hub are optional.
     log = ConversationLog(args.log_db) if args.log_db else None
@@ -62,21 +70,37 @@ async def main(args):
     if hub:
         await hub.start()
     conversation = RealtimeConversation(
-        furhat, scenario, model=args.model, debug=args.debug, log=log, hub=hub, gui=gui)
+        furhat, scenario, model=args.model, debug=args.debug, log=log, hub=hub, gui=gui,
+        wait_for_session=args.interaction)
 
     # Vision Perception module, feeding frames into the conversation
     vision = None
     if not args.no_vision:
-        vision = VisionModule(furhat, frame_interval=args.frame_interval, debug=args.debug)
+        config = None
+        if args.interaction:
+            config = PerceptionConfig(enter_distance_m=args.enter_distance,
+                                      exit_distance_m=args.exit_distance, distance_unit="m")
+        vision = VisionModule(furhat, frame_interval=args.frame_interval, debug=args.debug, config=config)
+        # Frames are only kept locally; one goes to Gemini with the opening cue and each user turn.
         vision.add_frame_listener(conversation.send_video_frame)
         if hub:
             vision.add_frame_listener(hub.send_frame)
+
+    # Interaction controller: perception state -> DORMANT / SUMMONING / AWAKE
+    controller = None
+    if args.interaction:
+        controller = InteractionController(furhat, gui, conversation, scenario)
+        await controller.start()
+        vision.add_state_listener(controller.on_state)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda: asyncio.create_task(conversation.stop()))
 
     print("Gemini writes each reply. Furhat TTS speaks it. Press Ctrl+C to stop.")
+    if controller:
+        print(f"Interaction mode: the Golem sleeps until someone comes within "
+              f"{args.enter_distance} m (leaves the zone beyond {args.exit_distance} m).")
     print("Switch behavior by typing default or golem, or by saying exactly:")
     print("  golem mode    |    normal mode")
     try:
@@ -89,6 +113,8 @@ async def main(args):
         print(f"Error in main loop: {e}")
     finally:
         print("Shutting down...")
+        if controller:
+            await controller.stop()
         try:
             await scenario.aclose()
         except Exception:
@@ -148,5 +174,15 @@ if __name__ == "__main__":
     parser.add_argument("--debug-ui-port", type=int, default=DEFAULT_PORT, help=f"Port for --debug-ui (default {DEFAULT_PORT})")
     parser.add_argument("--gui", action="store_true", help="Enable the Golem behaviour layer and debug panel")
     parser.add_argument("--gui_port", type=int, default=8090, help="Port of the debug panel web page (8080 is used by the Furhat SDK)")
+    parser.add_argument("--interaction", action="store_true", help="Golem reacts to visitor distance: sleeps, summons, wakes (requires --gui)")
+    parser.add_argument("--enter-distance", type=float, default=1.2, help="Metres: closer than this starts the conversation (--interaction)")
+    parser.add_argument("--exit-distance", type=float, default=1.5, help="Metres: farther than this leaves the interaction zone (--interaction)")
     parser.add_argument("--debug", action="store_true", help="Print debug info from the modules")
-    asyncio.run(main(parser.parse_args()))
+    args = parser.parse_args()
+    if args.interaction and not args.gui:
+        parser.error("--interaction requires --gui")
+    if args.interaction and args.no_vision:
+        parser.error("--interaction needs the camera and user tracking; remove --no-vision")
+    if args.interaction and not 0 < args.enter_distance < args.exit_distance:
+        parser.error("--enter-distance must be positive and smaller than --exit-distance")
+    asyncio.run(main(args))
