@@ -72,3 +72,9 @@ conversation = RealtimeConversation(furhat, scenario, model=args.model, debug=ar
 
 While the robot speaks, lipsync controls the mouth. Never send `MOUTH_*` or `JAW_*`
 params during speech. `GolemFace.smile()` already follows this rule.
+
+## LED owner
+
+While the active behavior has an LED pattern (golem), `ScenarioManager` owns the LED and
+`GolemFace.set_led()` does nothing (`main.py` sets `face.led_allowed`). See
+`interaction/README.md` for how sleep/awake change the light in that case.
