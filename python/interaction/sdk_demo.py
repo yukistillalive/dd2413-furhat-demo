@@ -30,11 +30,15 @@ from vision.perception_state import PerceptionConfig, PerceptionTracker
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
+# None = the visitor stays silent for one turn: the robot really listens (and hears nothing).
 VISITOR_LINES = [
     "Hello. Who are you?",
+    None, None, None, None, None,     # ~25 s of silence: one prompt, then the quiet "serene" wait
     "What are you guarding here?",
     "Thank you. Goodbye!",
 ]
+# Extra seconds before each model reply, to show the "Hmm..." filler (> 3 s).
+REPLY_DELAYS = [4.0]
 SCRIPTED_REPLIES = [
     {"say": "I am the Golem... shaped from river clay, long ago.", "emotion": "solemn"},
     {"say": "I guard the old words... and those who seek them.", "emotion": "serene"},
@@ -118,17 +122,25 @@ class DemoConversation(RealtimeConversation):
         super().__init__(*a, **kw)
         self.visitor = visitor
         self.scripted = list(SCRIPTED_REPLIES) if scripted else None
+        self.delays = list(REPLY_DELAYS)
 
     async def _listen_once(self) -> str:
+        if not self.visitor.lines:
+            self.visitor.done_talking.set()
+            return await super()._listen_once()
+        line = self.visitor.lines.pop(0)
+        if line is None:
+            log("visitor: says nothing (robot listens)")
+            return await super()._listen_once()
         await asyncio.sleep(1.5)
-        if self.visitor.lines:
-            line = self.visitor.lines.pop(0)
-            log(f"visitor says: \"{line}\"")
-            return line
-        self.visitor.done_talking.set()
-        return ""
+        log(f"visitor says: \"{line}\"")
+        return line
 
     async def _generate(self, contents, remember, use_json=True):
+        if self.delays:
+            delay = self.delays.pop(0)
+            log(f"(model reply delayed {delay:.0f} s for the demo)")
+            await asyncio.sleep(delay)
         if self.scripted is None:
             return await super()._generate(contents, remember, use_json)
         return json.dumps(self.scripted.pop(0) if self.scripted else {"say": "", "emotion": "neutral"})

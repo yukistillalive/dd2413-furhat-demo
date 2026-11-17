@@ -32,6 +32,13 @@ GREETINGS = {"hello", "hi", "hey", "help", "thanks", "thank"}
 REPAIR_LINE = "Sorry, I didn't catch that. Could you say it again?"
 # The opening line must never keep a visitor waiting longer than this.
 OPENING_TIMEOUT_S = 6.0
+# Slow reply: after this long the robot says a short in-character filler, then the reply.
+FILLER_DELAY_S = 3.0
+FILLER_LINE = "Hmm... let me consider."
+# One empty listen ends after NO_SPEECH_TIMEOUT_S; SILENCE_S is about two of them.
+NO_SPEECH_TIMEOUT_S = 5.0
+SILENCE_S = 9.0
+SILENCE_PROMPT = "Do you have a question for me, traveller?"
 
 
 def is_valid_user_turn(text: str) -> bool:
@@ -80,6 +87,16 @@ class RealtimeConversation:
         self._session_id = 0
         self._session_wake = asyncio.Event()
         self._opening: tuple[str, str] | None = None
+        self.clock = time.monotonic
+        self.filler_delay_s = FILLER_DELAY_S
+        self._filler_started = False
+        # Silence in a session (wait_for_session only): when the current silence began,
+        # and 0 = nothing done yet, 1 = prompted once, 2 = waiting quietly in "serene".
+        self._silent_since: float | None = None
+        self._silence_stage = 0
+        # The interaction controller clears this when the visitor is no longer in the
+        # interaction zone (walking off, person_left grace): no silence prompts then.
+        self._visitor_close = True
         print(f"[conversation] Gemini model: {self.model}")
 
     async def stop(self):
@@ -109,6 +126,10 @@ class RealtimeConversation:
         self._session_id += 1
         self._session_active = True
         self.behavior_changed.clear()
+        self._silent_since = None
+        self._silence_stage = 0
+        if self.gui:
+            self.gui.idle.mode = "listening"   # drop a "quiet"/"thinking" mode left from the last visitor
         if resume:
             self._opening = None
         else:
@@ -125,6 +146,12 @@ class RealtimeConversation:
         self._opening = None
         self._session_wake.set()
         await self._stop_robot_io()
+
+    def set_visitor_close(self, close: bool):
+        """Controller hook: is the visitor in the interaction zone? Silence only counts while they are."""
+        if close and not self._visitor_close:
+            self._silent_since = None   # back in front of the robot: start the silence count again
+        self._visitor_close = close
 
     @property
     def session_active(self) -> bool:
@@ -173,13 +200,20 @@ class RealtimeConversation:
                     await self._log_event("behavior", self.scenario.scenario.name)
                     await self._speak_cue(switched=True)
                     continue
+                if self.wait_for_session and self._silent_since is None:
+                    self._silent_since = self.clock()
                 heard = await self._listen_once()
                 if self.stop_event.is_set():
                     break
                 if not self._in_session(session_id):
                     continue
-                if self.behavior_changed.is_set() or not heard.strip():
+                if self.behavior_changed.is_set():
                     continue
+                if not heard.strip():
+                    if self.wait_for_session:
+                        await self._on_silence(session_id)
+                    continue
+                await self._on_visitor_spoke()
                 print("User:", heard)
                 await self._log_message("user", heard)
                 command = match_behavior_command(heard)
@@ -194,9 +228,15 @@ class RealtimeConversation:
                     print("[conversation] skipped Gemini call: rate-limit pause")
                     await self._log_event("rate_limit", "paused")
                     continue
-                reply = await self._complete(heard, session_id)
-                if reply and not self.behavior_changed.is_set() and self._in_session(session_id):
-                    await self._speak(reply)
+                if self.gui:
+                    await self.gui.idle.on_waiting_for_model()
+                try:
+                    reply = await self._complete(heard, session_id)
+                    if reply and not self.behavior_changed.is_set() and self._in_session(session_id):
+                        await self._speak(reply)
+                finally:
+                    if self.gui:
+                        await self.gui.idle.on_reply_done()
         finally:
             await self._set_state("stopped")
             if self.log:
@@ -267,7 +307,16 @@ class RealtimeConversation:
 
     async def _complete(self, heard: str, session_id: int = 0) -> str:
         user = self._user_content(heard, image_b64=self.latest_frame if self.scenario.use_vision else None)
-        raw = await self._generate(self.history + [user], remember=False)
+        self._filler_started = False
+        filler = asyncio.create_task(self._filler_after_delay(session_id))
+        try:
+            raw = await self._generate(self.history + [user], remember=False)
+        finally:
+            if self._filler_started:
+                await asyncio.wait({filler})   # let "Hmm..." finish before the reply
+            else:
+                filler.cancel()
+                await asyncio.gather(filler, return_exceptions=True)
         if not raw or not self._in_session(session_id):
             return ""
         say = await self._perform_reply(raw)
@@ -276,6 +325,49 @@ class RealtimeConversation:
             self.history.append(types.Content(role="model", parts=[types.Part(text=say)]))
         self._trim_history()
         return say
+
+    async def _filler_after_delay(self, session_id: int):
+        """Say FILLER_LINE if the model is still busy after filler_delay_s. The face stays "thinking"."""
+        await asyncio.sleep(self.filler_delay_s)
+        if (not self._in_session(session_id) or self.stop_event.is_set()
+                or self.behavior_changed.is_set()):
+            return
+        self._filler_started = True
+        await self._log_event("filler", FILLER_LINE)
+        if self.gui:
+            self.gui.idle.filler_speaking = True
+        try:
+            await self._speak(FILLER_LINE)
+        finally:
+            if self.gui:
+                self.gui.idle.filler_speaking = False
+
+    async def _on_visitor_spoke(self):
+        self._silent_since = None
+        self._silence_stage = 0
+        if self.gui:
+            await self.gui.idle.on_user_turn_start()
+
+    async def _on_silence(self, session_id: int):
+        """Empty listen in a session: prompt once after ~10 s, then wait quietly in "serene"."""
+        if not self._visitor_close:
+            self._silent_since = None   # nobody in front of the robot: nothing to prompt
+            return
+        if self._silent_since is None or self.clock() - self._silent_since < SILENCE_S:
+            return
+        if self._silence_stage == 0:
+            self._silence_stage = 1
+            print("[conversation] visitor silent, prompting once")
+            await self._log_event("silence", "prompt")
+            self.history.append(types.Content(role="model", parts=[types.Part(text=SILENCE_PROMPT)]))
+            self._trim_history()
+            await self._speak(SILENCE_PROMPT)   # restarts the silence timer
+        elif self._silence_stage == 1:
+            self._silence_stage = 2
+            print("[conversation] visitor still silent, waiting quietly")
+            await self._log_event("silence", "quiet")
+            if self.gui and self._in_session(session_id):
+                await self.gui.idle.on_quiet_wait()
 
     async def _perform_reply(self, raw: str) -> str:
         """Show the reply's emotion on the face. Return only the sentence that should be spoken."""
@@ -351,6 +443,8 @@ class RealtimeConversation:
             return
         await self._log_message("robot", text)
         await self._set_state("listening")
+        if self._silent_since is not None:
+            self._silent_since = None   # silence is counted from the next listen
 
     async def _emit(self, **obj):
         if not self.hub:
@@ -405,7 +499,7 @@ class RealtimeConversation:
                 stop_no_speech=True,
                 stop_robot_start=True,
                 stop_user_end=True,
-                no_speech_timeout=8.0,
+                no_speech_timeout=NO_SPEECH_TIMEOUT_S,
                 end_speech_timeout=1.8,
             )
             return await asyncio.wait_for(future, timeout=40.0)

@@ -128,6 +128,10 @@ class FakeConversation:
         self.starts = []   # resume flags, one per start_session
         self.ends = 0
         self.latest_frame = None
+        self.close = []   # (time, close) from set_visitor_close
+
+    def set_visitor_close(self, close):
+        self.close.append((self.clock(), close))
 
     def start_session(self, opening_cue, fallback_line, resume=False):
         self.active = True
@@ -270,6 +274,8 @@ async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=No
     spoken = [kw["text"] for _, call, kw in furhat.calls if call == "speak"]
     return dict(
         transitions=[(a, b) for _, a, b, _ in controller.transitions],
+        transition_times=[(t, a, b) for t, a, b, _ in controller.transitions],
+        close=conversation.close,
         summons=len(spoken),
         greetings=conversation.starts.count(False),
         resumes=conversation.starts.count(True),

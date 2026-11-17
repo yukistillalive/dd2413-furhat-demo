@@ -79,6 +79,7 @@ class InteractionController:
         self._far_since: float | None = None
         self._left_at: float | None = None
         self._left_visitor: Visitor | None = None   # set only during the grace window
+        self._visitor_close: bool | None = None     # last value sent to conversation.set_visitor_close
         self._task: asyncio.Task | None = None
 
     # ---- lifecycle ----
@@ -115,6 +116,11 @@ class InteractionController:
             return
         visitor = self.visitor
         zone = state.get("zone")
+        # The conversation prompts a silent visitor only while they stand in the interaction zone.
+        close = visitor is not None and bool(state.get("target_visible")) and zone == "interaction"
+        if close != self._visitor_close:
+            self._visitor_close = close
+            self.conversation.set_visitor_close(close)
         if visitor is None:
             self._far_since = None
             return

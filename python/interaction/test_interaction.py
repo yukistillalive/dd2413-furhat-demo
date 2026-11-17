@@ -19,6 +19,16 @@ class ReplayTests(unittest.TestCase):
         problems = [p for name, r in results.items() for p in replay.check(name, r)]
         self.assertEqual(problems, [])
 
+    def test_visitor_close_signal_follows_the_zone(self):
+        r = asyncio.run(replay.run_all(only="approach", out=lambda *_: None))["approach"]
+        awake_at = next(t for t, a, b in r["transition_times"] if b == "AWAKE")
+        asleep_at = next(t for t, a, b in r["transition_times"] if a == "AWAKE")
+        values = [c for _, c in r["close"]]
+        self.assertEqual(values[-2:], [True, False])
+        on, off = r["close"][-2][0], r["close"][-1][0]
+        self.assertLessEqual(on, awake_at, "close before the greeting")
+        self.assertLess(off, asleep_at, "not close during the person_left grace")
+
     def test_recording_never_awake_at_1_2_m(self):
         results = asyncio.run(replay.run_all(only="recording", out=lambda *_: None))
         self.assertNotIn("AWAKE", {b for _, b in results["recording"]["transitions"]})
@@ -132,6 +142,152 @@ class ConversationSessionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.1)
         self.assertEqual(self.spoken(), [FALLBACK_GREETING], "resume must not greet again")
         self.assertGreater(self.count("listen_start"), listens)
+
+
+class ScriptedFurhat(replay.FakeFurhat):
+    """Listens follow a script of (heard text, seconds); each one moves the fake clock.
+
+    Records (call, text/heard, idle mode, face expression) so tests can see what
+    the face looked like at every listen and after every spoken line.
+    """
+
+    def __init__(self, script):
+        self.now = 0.0
+        super().__init__(lambda: self.now, lambda *_: None)
+        self.script = list(script)
+        self.gui = None
+        self.trace = []
+
+    def snapshot(self, call, text):
+        self.trace.append((call, text, self.gui.idle.mode, self.gui.face.expression))
+
+    async def request_listen_config(self, **kw):
+        self._record("listen_config")
+
+    async def request_listen_start(self, **kw):
+        self._record("listen_start")
+        self.snapshot("listen", None)
+        if not self.script:
+            return   # nothing more to hear: the listen stays open until the test stops
+        text, seconds = self.script.pop(0)
+        self.now += seconds
+
+        async def finish():
+            await asyncio.sleep(0.01)
+            if text:
+                await self._dispatch(Events.response_hear_end, {"text": text})
+            await self._dispatch(Events.response_listen_end)
+        asyncio.ensure_future(finish())
+
+    async def request_speak_text(self, text, abort=False, wait=False, monitor_words=False):
+        await super().request_speak_text(text, abort=abort, wait=wait)
+        self.snapshot("said", text)
+
+
+class TurnTakingTests(unittest.IsolatedAsyncioTestCase):
+    """Thinking face + filler while Gemini works, and the silence prompt in a session."""
+
+    REPLY = '{"say":"I guard the old words.","emotion":"solemn"}'
+
+    async def start(self, script, delay=0.0, session=True):
+        self.furhat = ScriptedFurhat(script)
+        scenario = ScenarioManager("golem")
+        scenario.bind(self.furhat)
+        self.gui = GolemGUI(self.furhat)
+        self.gui.face.led_allowed = lambda: not scenario.owns_led()
+        self.furhat.gui = self.gui
+        await self.gui.golem.awaken()
+        self.gui.idle.start()
+        self.conv = rc.RealtimeConversation(self.furhat, scenario, api_key="offline-test",
+                                            gui=self.gui, wait_for_session=session)
+        self.conv.clock = lambda: self.furhat.now
+        self.conv.filler_delay_s = 0.1
+        self.at_generate = []
+
+        async def fake_generate(contents, remember, use_json=True):
+            self.at_generate.append((self.gui.idle.mode, self.gui.face.expression))
+            await asyncio.sleep(delay)
+            return self.REPLY
+
+        self.conv._generate = fake_generate
+        self.task = asyncio.create_task(self.conv.run())
+        if session:
+            self.conv.start_session(None, FALLBACK_GREETING)
+        await asyncio.sleep(0.3 + 2 * delay)
+
+    async def asyncTearDown(self):
+        await self.conv.stop()
+        await asyncio.wait({self.task}, timeout=2)
+        await self.gui.idle.stop()
+
+    def spoken(self):
+        return [kw["text"] for _, call, kw in self.furhat.calls if call == "speak"]
+
+    def said(self, text):
+        return next((mode, expr) for call, t, mode, expr in self.furhat.trace if call == "said" and t == text)
+
+    async def test_fast_reply_thinks_without_filler(self):
+        await self.start([("What are you guarding here?", 1)], delay=0.0)
+        self.assertEqual(self.at_generate, [("thinking", "thinking")])
+        self.assertEqual(self.spoken(), [FALLBACK_GREETING, "I guard the old words."])
+        self.assertEqual(self.gui.face.expression, "solemn", "the reply's emotion replaces thinking")
+        self.assertEqual(self.gui.idle.mode, "listening")
+
+    async def test_slow_reply_says_filler_then_reply(self):
+        await self.start([("What are you guarding here?", 1)], delay=0.3)
+        self.assertEqual(self.spoken(), [FALLBACK_GREETING, rc.FILLER_LINE, "I guard the old words."])
+        self.assertEqual(self.said(rc.FILLER_LINE), ("thinking", "thinking"),
+                         "the filler must not end the thinking mode")
+        self.assertEqual(self.said("I guard the old words."), ("listening", "solemn"))
+
+    async def test_reply_before_filler_delay_cancels_filler(self):
+        await self.start([("What are you guarding here?", 1)], delay=0.05)
+        await asyncio.sleep(0.2)
+        self.assertNotIn(rc.FILLER_LINE, self.spoken())
+
+    async def test_silence_prompts_once_then_waits_serene(self):
+        silence = [("", rc.NO_SPEECH_TIMEOUT_S)]
+        await self.start(silence * 6 + [("Who are you, golem?", 1)])
+        spoken = self.spoken()
+        self.assertEqual(spoken, [FALLBACK_GREETING, rc.SILENCE_PROMPT, "I guard the old words."])
+        listens = [(mode, expr) for call, _, mode, expr in self.furhat.trace if call == "listen"]
+        # listens 1-2: silent -> prompt; 3-4: silent -> serene; 5-7 stay quiet until the visitor speaks
+        self.assertNotEqual(listens[3][1], "serene")
+        self.assertEqual(listens[4:7], [("quiet", "serene")] * 3)
+        self.assertEqual(self.at_generate, [("thinking", "thinking")], "speaking ends the serene wait")
+        self.assertEqual(self.gui.face._held, {}, "serene eyelids released")
+
+    async def test_speech_restarts_the_silence(self):
+        silence = ("", rc.NO_SPEECH_TIMEOUT_S)
+        await self.start([silence, ("Hello there, friend", 1), silence])
+        self.assertNotIn(rc.SILENCE_PROMPT, self.spoken())
+
+    async def test_no_silence_prompt_without_sessions(self):
+        await self.start([("", rc.NO_SPEECH_TIMEOUT_S)] * 6, session=False)
+        self.assertNotIn(rc.SILENCE_PROMPT, self.spoken())
+
+    async def test_no_silence_prompt_while_visitor_is_not_close(self):
+        silence = ("", rc.NO_SPEECH_TIMEOUT_S)
+        await self.start([])
+        self.conv.set_visitor_close(False)   # walking off / person_left grace
+        self.furhat.script = [silence] * 4
+        await self.conv._stop_robot_io()     # end the open listen so the new script is used
+        await asyncio.sleep(0.3)
+        self.assertNotIn(rc.SILENCE_PROMPT, self.spoken())
+        self.conv.set_visitor_close(True)    # back in the zone: silence counts again from now
+        self.furhat.script = [silence] * 2
+        await self.conv._stop_robot_io()
+        await asyncio.sleep(0.3)
+        self.assertEqual(self.spoken().count(rc.SILENCE_PROMPT), 1)
+
+    async def test_new_session_resets_silence_and_quiet_mode(self):
+        await self.start([("", rc.NO_SPEECH_TIMEOUT_S)] * 4)
+        self.assertEqual(self.gui.idle.mode, "quiet")
+        await self.conv.end_session()
+        self.furhat.script = [("", rc.NO_SPEECH_TIMEOUT_S)] * 2
+        self.conv.start_session(None, FALLBACK_GREETING)
+        await asyncio.sleep(0.3)
+        self.assertEqual(self.spoken().count(rc.SILENCE_PROMPT), 2, "a new visitor gets their own prompt")
 
 
 class LedOwnerTests(unittest.IsolatedAsyncioTestCase):
