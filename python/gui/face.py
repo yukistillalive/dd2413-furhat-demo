@@ -22,6 +22,9 @@ class GolemFace:
         self._tasks = set()        # keep references to delayed tasks so they are not garbage-collected
         self._held = {}            # face params kept active by hold_params()
         self._hold_task = None
+        # LED owner check. main.py sets this to "scenario has no LED pattern":
+        # in golem mode the scenario's breathing LED owns the LED and set_led() does nothing.
+        self.led_allowed = lambda: True
         # Streamed audio sends no speak.start, only audio.buffer events while playing
         furhat.add_handler([Events.response_speak_start, Events.response_speak_audio_buffer], self._on_speak_start)
         furhat.add_handler(Events.response_speak_end, self._on_speak_end)
@@ -115,4 +118,6 @@ class GolemFace:
     # ---- LED ----
 
     async def set_led(self, color: str):
+        if not self.led_allowed():
+            return
         await self.furhat.request_led_set(color)  # "#rrggbb", "#000000" = off

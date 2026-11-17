@@ -56,6 +56,8 @@ Switch while `main.py` is running:
 - Type `default` or `1`, or `golem` or `2`, in the terminal.
 - Or say the whole utterance as exactly one of: `golem mode`, `switch to golem`, `be the golem`, `golem`, `normal mode`, `default mode`, `switch to normal`, `normal`, `default`. These phrases are passed to Furhat's recognizer. A longer sentence that only mentions the word does not switch.
 
+Gemini replies as `{"say": "...", "emotion": "<label>"}`. The label is one of the `gui/expressions.py` names (`neutral`, `solemn`, `curious`, `warm`, `thinking`, `serene`); with `--gui` the face performs it. Unknown labels become `neutral`. The model can no longer send raw face or LED requests.
+
 `--golem-face FACE_ID` gives Golem its own installed face. Without it, Golem keeps the startup face. The program does not pick a different face on its own. Startup prints the installed face ids.
 
 ## Conversation log
@@ -84,5 +86,6 @@ python/
 ├── vision/          Vision Perception: reads Furhat camera frames, passes them to listeners
 ├── scenario/        Scenario Setting: prompt -> WebSocket requests
 ├── gui/             Golem behaviour layer: face, expressions, idle, tools, debug panel
+├── interaction/     Distance -> DORMANT / SUMMONING / AWAKE (--interaction, see interaction/README.md)
 └── demos/           The original standalone examples from Furhat
 ```

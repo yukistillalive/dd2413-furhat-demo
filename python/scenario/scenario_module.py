@@ -19,6 +19,9 @@ from dataclasses import dataclass, replace
 
 from furhat_realtime_api import AsyncFurhatClient
 
+# Expression labels the model may return; gui/expressions.py EXPRESSIONS keys.
+from gui.expressions import LABELS as EMOTION_LABELS
+
 
 SPOKEN_RULES = (
     "Speak English. Everything you say is spoken aloud by a robot, so use one or "
@@ -32,24 +35,12 @@ VISION_NOTE = (
 
 REPLY_FORMAT = (
     "Return one JSON object and no other text. "
-    'Shape: {"say":"sentence to speak","requests":[]}. '
+    'Shape: {"say":"sentence to speak","emotion":"neutral"}. '
     "say is one or two short English sentences. "
-    "requests changes appearance and is never spoken. Use [] when nothing should change. "
-    'Allowed requests: {"type":"request.led.set","color":"#RRGGBB"}; '
-    '{"type":"request.face.config","face_id":"installed id","visibility":true,'
-    '"microexpressions":true,"blinking":true,"head_sway":false}; '
-    '{"type":"request.face.params","params":{"SMILE_CLOSED":0.4}}. '
-    "Do not request speech, listening, camera, or audio."
+    "emotion is how your face looks while you say it and is never spoken. "
+    "Allowed emotion values: " + ", ".join(EMOTION_LABELS) + ". "
+    "Do not output any other fields, requests, colours, or face settings."
 )
-
-_APPEARANCE_FIELDS = {
-    "request.led.set": frozenset({"color"}),
-    "request.face.config": frozenset({"face_id", "visibility", "microexpressions", "blinking", "head_sway"}),
-    "request.face.params": frozenset({"params"}),
-}
-_HEX_COLOR = re.compile(r"^#?[0-9A-Fa-f]{6}$")
-_MOUTH_PARAM = re.compile(r"^(MOUTH|JAW)", re.I)
-
 
 @dataclass(frozen=True)
 class Scenario:
@@ -170,38 +161,33 @@ def behavior_command_phrases() -> list[str]:
 @dataclass(frozen=True)
 class ModelReply:
     say: str
-    requests: tuple[dict, ...]
+    emotion: str = "neutral"
 
 
 def parse_model_reply(raw: str) -> ModelReply:
-    """Split a model reply into a spoken sentence and appearance requests.
+    """Split a model reply into a spoken sentence and an expression label.
 
-    Plain text with no request payload is spoken as-is. JSON that names a
-    request but cannot be validated is not spoken.
+    Plain text with no JSON payload is spoken as-is. JSON, or text that looks
+    like a raw robot request, is spoken only through its "say" field.
+    A missing or unknown emotion becomes "neutral".
     """
     text = (raw or "").strip()
     data = _json_object(text)
     if data is None:
         if re.search(r"request\.|^\s*[\[{]", text):
-            return ModelReply("", ())
-        return ModelReply(" ".join(text.split()), ())
-    if "say" not in data and "requests" not in data and "type" in data:
-        event = _appearance_event(data)
-        return ModelReply("", (event,) if event else ())
+            return ModelReply("")
+        return ModelReply(" ".join(text.split()))
     say = data.get("say", "")
     say = " ".join(say.split()) if isinstance(say, str) else ""
-    events = []
-    incoming = data.get("requests") or []
-    if isinstance(incoming, dict):
-        incoming = [incoming]
-    if isinstance(incoming, list):
-        for item in incoming:
-            event = _appearance_event(item)
-            if event:
-                events.append(event)
-            if len(events) == 4:
-                break
-    return ModelReply(say, tuple(events))
+    if re.search(r"request\.", say):
+        say = ""
+    return ModelReply(say, _emotion(data.get("emotion")))
+
+
+def _emotion(value) -> str:
+    if isinstance(value, str) and value.strip().lower() in EMOTION_LABELS:
+        return value.strip().lower()
+    return "neutral"
 
 
 def _json_object(text: str) -> dict | None:
@@ -217,75 +203,6 @@ def _json_object(text: str) -> dict | None:
         except json.JSONDecodeError:
             return None
     return data if isinstance(data, dict) else None
-
-
-def _appearance_event(item) -> dict | None:
-    if not isinstance(item, dict):
-        return None
-    kind = item.get("type")
-    allowed = _APPEARANCE_FIELDS.get(kind)
-    if allowed is None:
-        return None
-    event = {"type": kind}
-    for key in allowed:
-        if key not in item:
-            continue
-        value = _appearance_value(kind, key, item[key])
-        if value is None:
-            return None
-        event[key] = value
-    if kind == "request.led.set" and "color" not in event:
-        return None
-    if kind == "request.face.params" and not event.get("params"):
-        return None
-    if len(event) == 1:
-        return None
-    return event
-
-
-def _appearance_value(kind: str, key: str, value):
-    if kind == "request.led.set" and key == "color":
-        if not isinstance(value, str) or not _HEX_COLOR.match(value.strip()):
-            return None
-        color = value.strip().lstrip("#")
-        return "#" + color.upper()
-    if key == "face_id":
-        if not isinstance(value, str):
-            return None
-        face_id = " ".join(value.split())
-        if not face_id or len(face_id) > 80:
-            return None
-        return face_id
-    if key in {"visibility", "microexpressions", "blinking", "head_sway"}:
-        return _as_bool(value)
-    if key == "params":
-        return _face_params(value)
-    return None
-
-
-def _as_bool(value):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str) and value.lower() in {"true", "false"}:
-        return value.lower() == "true"
-    return None
-
-
-def _face_params(value) -> dict | None:
-    if not isinstance(value, dict) or not value:
-        return None
-    params = {}
-    for name, level in value.items():
-        if not isinstance(name, str) or _MOUTH_PARAM.match(name):
-            continue
-        if isinstance(level, bool) or not isinstance(level, (int, float)):
-            continue
-        if level != level or abs(level) > 100:
-            continue
-        params[name] = float(level)
-        if len(params) == 8:
-            break
-    return params or None
 
 
 def _face_entries(face_list) -> list[dict]:
@@ -306,6 +223,11 @@ class ScenarioManager:
         self.scenario = SCENARIOS[scenario] if isinstance(scenario, str) else scenario
         self.golem_face_id = golem_face_id
         self.use_vision = False
+        # False when the GUI idle layer does the blinking (--gui), so Furhat does not blink too.
+        self.builtin_blinking = True
+        # LED ownership: while the behavior has an LED pattern (golem), this class owns the LED.
+        # hold_led() pauses the pattern on one fixed colour (used for dormant/summoning).
+        self._led_hold: str | None = None
         self._furhat: AsyncFurhatClient | None = None
         self._original_face_id: str | None = None
         self._original_voice_id: str | None = None
@@ -354,7 +276,11 @@ class ScenarioManager:
         text = self.scenario.enter_prompt if switched else self.scenario.opening_prompt
         if not text or not text.strip():
             raise ValueError("Refusing to send an empty cue")
-        return text.strip() + " Put the spoken line in say. Leave requests empty unless appearance should change."
+        return text.strip() + " Put the spoken line in say and choose one emotion."
+
+    def with_reply_reminder(self, cue: str) -> str:
+        """Any extra cue (e.g. the interaction opening) with the same reply-format reminder."""
+        return cue.strip() + " Put the spoken line in say and choose one emotion."
 
     async def switch(self, name: str) -> bool:
         """Change behavior. Returns False if that behavior is already active."""
@@ -415,7 +341,7 @@ class ScenarioManager:
             "type": "request.face.config",
             "visibility": True,
             "microexpressions": self.scenario.microexpressions,
-            "blinking": True,
+            "blinking": self.builtin_blinking,
             "head_sway": self.scenario.head_sway,
         }
         if target:
@@ -447,11 +373,32 @@ class ScenarioManager:
             except asyncio.CancelledError:
                 pass
 
+    def owns_led(self) -> bool:
+        """True while this behavior's LED pattern controls the LED (GUI must not set it)."""
+        return bool(self.scenario.led_frames)
+
+    async def hold_led(self, color: str):
+        """Pause the LED pattern and show one fixed colour until release_led()."""
+        self._led_hold = color
+        await self.stop_led_loop()
+        await self._furhat.request_led_set(color)
+
+    async def release_led(self):
+        """End hold_led(). The behavior's pattern resumes; without a pattern the LED is left as is."""
+        if self._led_hold is None:
+            return
+        self._led_hold = None
+        if self.scenario.led_frames:
+            self._restart_led()
+
     def _restart_led(self):
         self._led_generation += 1
         generation = self._led_generation
         self._led_wake.set()
         frames = self.scenario.led_frames
+        if self._led_hold is not None:
+            # A behavior switch while held keeps the held colour.
+            frames = ((self._led_hold, 3600.0),)
         self._led_task = asyncio.create_task(self._led_loop(generation, frames))
 
     async def _led_loop(self, generation: int, frames: tuple[tuple[str, float], ...]):

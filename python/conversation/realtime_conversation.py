@@ -8,7 +8,6 @@ is not used. That code is commented out in gemini_live_audio.py.
 """
 import asyncio
 import base64
-import json
 import os
 import re
 import time
@@ -17,6 +16,7 @@ from google import genai
 from google.genai import errors, types
 from furhat_realtime_api import AsyncFurhatClient, Events
 
+from gui.expressions import perform
 from scenario import ScenarioManager, behavior_command_phrases, match_behavior_command, parse_model_reply
 
 # gofast model that is still on the Gemini API. Override with --model.
@@ -29,6 +29,16 @@ FILLER_WORDS = {
     "oh", "well", "like", "so", "just", "that",
 }
 GREETINGS = {"hello", "hi", "hey", "help", "thanks", "thank"}
+REPAIR_LINE = "Sorry, I didn't catch that. Could you say it again?"
+# The opening line must never keep a visitor waiting longer than this.
+OPENING_TIMEOUT_S = 6.0
+# Slow reply: after this long the robot says a short in-character filler, then the reply.
+FILLER_DELAY_S = 3.0
+FILLER_LINE = "Hmm... let me consider."
+# One empty listen ends after NO_SPEECH_TIMEOUT_S; SILENCE_S is about two of them.
+NO_SPEECH_TIMEOUT_S = 5.0
+SILENCE_S = 9.0
+SILENCE_PROMPT = "Do you have a question for me, traveller?"
 
 
 def is_valid_user_turn(text: str) -> bool:
@@ -47,7 +57,7 @@ def is_valid_user_turn(text: str) -> bool:
 class RealtimeConversation:
     def __init__(self, furhat: AsyncFurhatClient, scenario: ScenarioManager,
                  model: str = TEXT_MODEL, api_key: str | None = None, debug: bool = False,
-                 log=None, hub=None):
+                 log=None, hub=None, gui=None, wait_for_session: bool = False):
         api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in the environment or .env")
@@ -60,6 +70,8 @@ class RealtimeConversation:
         self.debug = debug
         self.log = log
         self.hub = hub
+        # GolemGUI (--gui): the reply's emotion label is performed on the face.
+        self.gui = gui
         self.client = genai.Client(api_key=api_key)
         self.history: list[types.Content] = []
         self.latest_frame: str | None = None
@@ -68,6 +80,23 @@ class RealtimeConversation:
         self.shutting_down = False
         self._listen_future: asyncio.Future | None = None
         self._backoff_until = 0.0
+        # wait_for_session=True (--interaction): run() neither speaks nor listens until
+        # start_session() is called, and goes quiet again after end_session().
+        self.wait_for_session = wait_for_session
+        self._session_active = False
+        self._session_id = 0
+        self._session_wake = asyncio.Event()
+        self._opening: tuple[str, str] | None = None
+        self.clock = time.monotonic
+        self.filler_delay_s = FILLER_DELAY_S
+        self._filler_started = False
+        # Silence in a session (wait_for_session only): when the current silence began,
+        # and 0 = nothing done yet, 1 = prompted once, 2 = waiting quietly in "serene".
+        self._silent_since: float | None = None
+        self._silence_stage = 0
+        # The interaction controller clears this when the visitor is no longer in the
+        # interaction zone (walking off, person_left grace): no silence prompts then.
+        self._visitor_close = True
         print(f"[conversation] Gemini model: {self.model}")
 
     async def stop(self):
@@ -84,6 +113,55 @@ class RealtimeConversation:
         self.behavior_changed.set()
         asyncio.get_running_loop().create_task(self._stop_robot_io())
 
+    # ---- Session hooks for the interaction controller ----
+
+    def start_session(self, opening_cue: str | None, fallback_line: str, resume: bool = False):
+        """Start talking with a visitor.
+
+        New visitor: forget the old history, speak an opening generated from
+        opening_cue plus the latest camera frame (fallback_line if that fails),
+        then listen. resume=True: same visitor came back, so keep the history and
+        go straight to listening without an opening line.
+        """
+        self._session_id += 1
+        self._session_active = True
+        self.behavior_changed.clear()
+        self._silent_since = None
+        self._silence_stage = 0
+        if self.gui:
+            self.gui.idle.mode = "listening"   # drop a "quiet"/"thinking" mode left from the last visitor
+        if resume:
+            self._opening = None
+        else:
+            self.history = []
+            self._opening = (opening_cue or "", fallback_line)
+        self._session_wake.set()
+
+    async def end_session(self):
+        """Stop speaking and listening now. run() waits for the next start_session()."""
+        if not self._session_active:
+            return
+        self._session_active = False
+        self._session_id += 1
+        self._opening = None
+        self._session_wake.set()
+        await self._stop_robot_io()
+
+    def set_visitor_close(self, close: bool):
+        """Controller hook: is the visitor in the interaction zone? Silence only counts while they are."""
+        if close and not self._visitor_close:
+            self._silent_since = None   # back in front of the robot: start the silence count again
+        self._visitor_close = close
+
+    @property
+    def session_active(self) -> bool:
+        return self._session_active
+
+    def _in_session(self, session_id: int) -> bool:
+        if not self.wait_for_session:
+            return True
+        return self._session_active and self._session_id == session_id
+
     async def send_video_frame(self, image_b64: str):
         """Keep the newest camera frame for the next text reply. Nothing is streamed live."""
         self.latest_frame = image_b64
@@ -95,24 +173,47 @@ class RealtimeConversation:
             await self.log.start_session(
                 self.model, self.scenario.scenario.name, self.scenario.instruction_text())
         try:
-            await self.furhat.request_attend_user()
+            if not self.wait_for_session:
+                await self.furhat.request_attend_user()
             await self.furhat.request_listen_config(
                 languages=["en-US"],
                 phrases=behavior_command_phrases(),
             )
-            await self._speak_cue(switched=False)
-            await self._set_state("listening")
+            if not self.wait_for_session:
+                await self._speak_cue(switched=False)
+                await self._set_state("listening")
             while not self.stop_event.is_set():
+                if self.wait_for_session and not self._session_active:
+                    await self._set_state("idle")
+                    self._session_wake.clear()
+                    await self._wait_for_session_change()
+                    continue
+                session_id = self._session_id
+                if self._opening is not None:
+                    cue, fallback = self._opening
+                    self._opening = None
+                    await self._log_event("session", "start")
+                    await self._speak_opening(cue, fallback, session_id)
+                    continue
                 if self.behavior_changed.is_set():
                     self.behavior_changed.clear()
                     await self._log_event("behavior", self.scenario.scenario.name)
                     await self._speak_cue(switched=True)
                     continue
+                if self.wait_for_session and self._silent_since is None:
+                    self._silent_since = self.clock()
                 heard = await self._listen_once()
                 if self.stop_event.is_set():
                     break
-                if self.behavior_changed.is_set() or not heard.strip():
+                if not self._in_session(session_id):
                     continue
+                if self.behavior_changed.is_set():
+                    continue
+                if not heard.strip():
+                    if self.wait_for_session:
+                        await self._on_silence(session_id)
+                    continue
+                await self._on_visitor_spoke()
                 print("User:", heard)
                 await self._log_message("user", heard)
                 command = match_behavior_command(heard)
@@ -127,13 +228,57 @@ class RealtimeConversation:
                     print("[conversation] skipped Gemini call: rate-limit pause")
                     await self._log_event("rate_limit", "paused")
                     continue
-                reply = await self._complete(heard)
-                if reply and not self.behavior_changed.is_set():
-                    await self._speak(reply)
+                if self.gui:
+                    await self.gui.idle.on_waiting_for_model()
+                try:
+                    reply = await self._complete(heard, session_id)
+                    if reply and not self.behavior_changed.is_set() and self._in_session(session_id):
+                        await self._speak(reply)
+                finally:
+                    if self.gui:
+                        await self.gui.idle.on_reply_done()
         finally:
             await self._set_state("stopped")
             if self.log:
                 await self.log.end_session()
+
+    async def _wait_for_session_change(self):
+        stop = asyncio.ensure_future(self.stop_event.wait())
+        wake = asyncio.ensure_future(self._session_wake.wait())
+        try:
+            await asyncio.wait({stop, wake}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+            wake.cancel()
+
+    async def _speak_opening(self, cue: str, fallback: str, session_id: int):
+        """Opening line for a new visitor: cue + latest camera frame, or the fixed fallback.
+
+        The fallback is used when there is no frame, the call fails, or it takes
+        longer than OPENING_TIMEOUT_S, so the visitor is never left waiting.
+        """
+        image = self.latest_frame if self.scenario.use_vision else None
+        say = ""
+        if cue and image:
+            cue = self.scenario.with_reply_reminder(cue)
+            try:
+                raw = await asyncio.wait_for(
+                    self._generate([self._user_content(cue, image_b64=image)], remember=False),
+                    timeout=OPENING_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                raw = ""
+                print("[conversation] opening line timed out, using fallback")
+            if raw and raw != REPAIR_LINE and self._in_session(session_id):
+                say = await self._perform_reply(raw)
+        elif self.debug:
+            print("[conversation] no camera frame for the opening, using fallback")
+        if not self._in_session(session_id) or self.stop_event.is_set():
+            return
+        if not say:
+            say = fallback
+            await self._log_event("opening", "fallback")
+        self.history.append(types.Content(role="model", parts=[types.Part(text=say)]))
+        await self._speak(say)
 
     async def _switch_from_voice(self, name: str):
         try:
@@ -160,10 +305,19 @@ class RealtimeConversation:
         self._trim_history()
         await self._speak(say)
 
-    async def _complete(self, heard: str) -> str:
+    async def _complete(self, heard: str, session_id: int = 0) -> str:
         user = self._user_content(heard, image_b64=self.latest_frame if self.scenario.use_vision else None)
-        raw = await self._generate(self.history + [user], remember=False)
-        if not raw:
+        self._filler_started = False
+        filler = asyncio.create_task(self._filler_after_delay(session_id))
+        try:
+            raw = await self._generate(self.history + [user], remember=False)
+        finally:
+            if self._filler_started:
+                await asyncio.wait({filler})   # let "Hmm..." finish before the reply
+            else:
+                filler.cancel()
+                await asyncio.gather(filler, return_exceptions=True)
+        if not raw or not self._in_session(session_id):
             return ""
         say = await self._perform_reply(raw)
         self.history.append(user)
@@ -172,28 +326,62 @@ class RealtimeConversation:
         self._trim_history()
         return say
 
-    async def _perform_reply(self, raw: str) -> str:
-        """Run appearance requests. Return only the sentence that should be spoken."""
-        reply = parse_model_reply(raw)
-        for event in reply.requests:
-            if self.stop_event.is_set():
-                break
-            await self._send_appearance(event)
-        if not reply.say and not reply.requests and re.search(r"request\.|^\s*[\[{]", raw):
-            print("[conversation] withheld reply that looked like a request")
-            await self._log_event("appearance", "reply withheld: invalid request")
-        return reply.say
-
-    async def _send_appearance(self, event: dict):
+    async def _filler_after_delay(self, session_id: int):
+        """Say FILLER_LINE if the model is still busy after filler_delay_s. The face stays "thinking"."""
+        await asyncio.sleep(self.filler_delay_s)
+        if (not self._in_session(session_id) or self.stop_event.is_set()
+                or self.behavior_changed.is_set()):
+            return
+        self._filler_started = True
+        await self._log_event("filler", FILLER_LINE)
+        if self.gui:
+            self.gui.idle.filler_speaking = True
         try:
-            if event["type"] == "request.led.set":
-                await self.scenario.stop_led_loop()
-            await self.furhat.send_event(event)
-            print("[conversation] appearance:", event["type"], {k: v for k, v in event.items() if k != "type"})
-            await self._log_event("appearance", json.dumps(event, ensure_ascii=False))
-        except Exception as e:
-            print(f"[conversation] appearance request failed: {e}")
-            await self._log_event("appearance_failed", str(e))
+            await self._speak(FILLER_LINE)
+        finally:
+            if self.gui:
+                self.gui.idle.filler_speaking = False
+
+    async def _on_visitor_spoke(self):
+        self._silent_since = None
+        self._silence_stage = 0
+        if self.gui:
+            await self.gui.idle.on_user_turn_start()
+
+    async def _on_silence(self, session_id: int):
+        """Empty listen in a session: prompt once after ~10 s, then wait quietly in "serene"."""
+        if not self._visitor_close:
+            self._silent_since = None   # nobody in front of the robot: nothing to prompt
+            return
+        if self._silent_since is None or self.clock() - self._silent_since < SILENCE_S:
+            return
+        if self._silence_stage == 0:
+            self._silence_stage = 1
+            print("[conversation] visitor silent, prompting once")
+            await self._log_event("silence", "prompt")
+            self.history.append(types.Content(role="model", parts=[types.Part(text=SILENCE_PROMPT)]))
+            self._trim_history()
+            await self._speak(SILENCE_PROMPT)   # restarts the silence timer
+        elif self._silence_stage == 1:
+            self._silence_stage = 2
+            print("[conversation] visitor still silent, waiting quietly")
+            await self._log_event("silence", "quiet")
+            if self.gui and self._in_session(session_id):
+                await self.gui.idle.on_quiet_wait()
+
+    async def _perform_reply(self, raw: str) -> str:
+        """Show the reply's emotion on the face. Return only the sentence that should be spoken."""
+        reply = parse_model_reply(raw)
+        if not reply.say and re.search(r"request\.|^\s*[\[{]", raw):
+            print("[conversation] withheld reply that looked like a request")
+            await self._log_event("appearance", "reply withheld: invalid reply")
+        if reply.say and self.gui and self.gui.golem.awake and not self.stop_event.is_set():
+            try:
+                label = await perform(self.gui.face, reply.emotion)
+                await self._log_event("emotion", label)
+            except Exception as e:
+                print(f"[conversation] expression failed: {e}")
+        return reply.say
 
     async def _generate(self, contents: list[types.Content], remember: bool, use_json: bool = True) -> str:
         del remember
@@ -239,7 +427,7 @@ class RealtimeConversation:
         if self.debug:
             print("[conversation] Gemini text:", text)
         if not text:
-            return "Sorry, I didn't catch that. Could you say it again?"
+            return REPAIR_LINE
         return text
 
     async def _speak(self, text: str):
@@ -255,6 +443,8 @@ class RealtimeConversation:
             return
         await self._log_message("robot", text)
         await self._set_state("listening")
+        if self._silent_since is not None:
+            self._silent_since = None   # silence is counted from the next listen
 
     async def _emit(self, **obj):
         if not self.hub:
@@ -309,7 +499,7 @@ class RealtimeConversation:
                 stop_no_speech=True,
                 stop_robot_start=True,
                 stop_user_end=True,
-                no_speech_timeout=8.0,
+                no_speech_timeout=NO_SPEECH_TIMEOUT_S,
                 end_speech_timeout=1.8,
             )
             return await asyncio.wait_for(future, timeout=40.0)
