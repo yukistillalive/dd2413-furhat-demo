@@ -12,11 +12,12 @@ states and tells the behaviour layers what to do:
 
     DORMANT --far >= 1.5 s--> SUMMONING --interaction zone--> AWAKE
     DORMANT --interaction zone (no far wait)----------------> AWAKE
-    SUMMONING / AWAKE --person_left--> DORMANT
+    SUMMONING / AWAKE --person_left, nobody back within 5 s--> DORMANT
 
-Same-visitor rule: if someone is confirmed within 5 s after person_left, they
-are the same visitor (the robot's user id can change when a person moves).
-They get back the state they had, without a new summon line or greeting.
+Same-visitor rule: person_left does not put the Golem to sleep at once. It
+waits 5 s; if someone is confirmed in that window they are the same visitor
+(the robot's user id can change when a person moves) and the current state
+simply continues: no sleep, no awaken, no new summon line or greeting.
 
 on_state() only decides; it never waits for the robot. Robot actions run in
 one background task at a time, and a newer transition cancels an older one.
@@ -51,7 +52,7 @@ class InteractionConfig:
     far_dwell_s: float = 1.5      # far-zone time before SUMMONING
     summon_repeat_s: float = 10.0  # gap between summon lines
     max_summons: int = 2
-    same_visitor_s: float = 5.0    # reappearing within this after person_left = same visitor
+    same_visitor_s: float = 5.0    # grace after person_left before sleeping; back within it = same visitor
 
 
 @dataclass
@@ -77,8 +78,7 @@ class InteractionController:
         self._last_seq = 0
         self._far_since: float | None = None
         self._left_at: float | None = None
-        self._left_visitor: Visitor | None = None
-        self._left_state = DORMANT
+        self._left_visitor: Visitor | None = None   # set only during the grace window
         self._task: asyncio.Task | None = None
 
     # ---- lifecycle ----
@@ -105,6 +105,10 @@ class InteractionController:
     def decide(self, state: dict):
         now = self.clock()
         self._handle_events(state.get("events") or [], now)
+        if self._left_visitor is not None and now - self._left_at >= self.config.same_visitor_s:
+            # Grace window over and nobody came back: now really go to sleep.
+            self._left_visitor = None
+            self._go(DORMANT, f"nobody back {self.config.same_visitor_s:.0f} s after person_left", now)
         if state.get("status") != "ok":
             # stale or error: keep the current state, just do not start new timers
             self._far_since = None
@@ -118,13 +122,9 @@ class InteractionController:
             return
 
         if self.state == DORMANT:
-            if visitor.greeted:
-                self._go(AWAKE, "same visitor back", now)
-            elif zone == "interaction":
+            if zone == "interaction":
                 # Reached before 1.5 s in the far zone, otherwise we would be SUMMONING.
                 self._go(AWAKE, "walked straight in", now)
-            elif visitor.summons > 0:
-                self._go(SUMMONING, "same visitor back", now)
             else:  # far: wait for the dwell time
                 if self._far_since is None:
                     self._far_since = now
@@ -158,10 +158,10 @@ class InteractionController:
 
     def _on_person_entered(self, now: float, user_id):
         self._far_since = None
-        if self._left_visitor is not None and now - self._left_at <= self.config.same_visitor_s:
+        if self._left_visitor is not None:   # still inside the grace window
             self.visitor = self._left_visitor
-            self.log(f"[interaction] {user_id} within {now - self._left_at:.1f} s of leaving: same visitor"
-                     f" (was {self._left_state})")
+            self.log(f"[interaction] {user_id} back after {now - self._left_at:.1f} s: same visitor,"
+                     f" staying {self.state}")
         else:
             self.visitor = Visitor()
             self.log(f"[interaction] new visitor {user_id}")
@@ -171,12 +171,15 @@ class InteractionController:
         self._far_since = None
         if self.visitor is None:
             return
+        if self.state == DORMANT:   # never summoned or greeted: nothing to keep
+            self.visitor = None
+            return
+        # Keep the state; sleep only if nobody is back within the grace window (see decide()).
         self._left_at = now
         self._left_visitor = self.visitor
-        self._left_state = self.state
-        self.visitor = None
-        if self.state != DORMANT:
-            self._go(DORMANT, f"person_left {user_id}", now)
+        self.visitor = None   # pauses summon repeats while nobody is there
+        self.log(f"[interaction] person_left {user_id}: staying {self.state},"
+                 f" sleep in {self.config.same_visitor_s:.0f} s unless they come back")
 
     # ---- transitions ----
 
@@ -198,9 +201,8 @@ class InteractionController:
                 visitor.last_summon_at = now
             self._launch(self._act_summoning, speak)
         elif new_state == AWAKE:
-            resume = visitor.greeted
             visitor.greeted = True
-            self._launch(self._act_awake, resume)
+            self._launch(self._act_awake)
 
     def _launch(self, action, *args):
         """Run one robot action after cancelling the previous one."""
@@ -239,13 +241,13 @@ class InteractionController:
         self.log(f"Robot (summon): {line}")
         await self.furhat.request_speak_text(line, abort=True, wait=True)
 
-    async def _act_awake(self, resume: bool):
+    async def _act_awake(self):
         await self._quietly(self.furhat.request_speak_stop())
         await self.scenario.release_led()
         await self.gui.golem.awaken()
         await self.gui.face.gaze_user()
         await perform(self.gui.face, "warm")
-        self.conversation.start_session(OPENING_CUE, FALLBACK_GREETING, resume=resume)
+        self.conversation.start_session(OPENING_CUE, FALLBACK_GREETING)
 
     async def _quietly(self, coro):
         try:

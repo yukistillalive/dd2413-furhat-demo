@@ -15,8 +15,8 @@ interaction zone. `--interaction` needs `--gui` and the camera (no `--no-vision`
                  far zone >= 1.5 s                   interaction zone
    DORMANT  ─────────────────────────▶  SUMMONING  ─────────────────────▶  AWAKE
       │  ▲                                  │                               ▲  │
-      │  │◀──────── person_left ────────────┘                               │  │
-      │  └──────────────────────────── person_left ─────────────────────────┼──┘
+      │  │◀── person_left + 5 s nobody back ┘                               │  │
+      │  └─────────────────────── person_left + 5 s nobody back ────────────┼──┘
       └─────────── interaction zone without 1.5 s in the far zone ──────────┘
 ```
 
@@ -29,10 +29,12 @@ interaction zone. `--interaction` needs `--gui` and the camera (no `--no-vision`
 - AWAKE ends only when the person leaves, not when they step back into the far zone.
 - `person_left` comes from `vision/`: about 2 s after the user disappears, which on
   the real robot is itself 2–3 s after they walk off (the last distance stays frozen).
-- **Same visitor:** someone confirmed within 5 s after `person_left` gets the old
-  visitor's progress back: no new summon line and no new greeting. The robot still
-  goes to sleep at `person_left` and opens its eyes again (`awaken()`) on return,
-  because the eyes have to reopen; the conversation resumes with its history.
+  With the 5 s grace the Golem falls asleep roughly 9–10 s after someone walks away.
+- **Same visitor:** after `person_left` the Golem waits 5 s before `sleep()`. If someone
+  is confirmed in that window (the user id may have changed), the current state just
+  continues: no sleep/awaken flicker, no new summon line or greeting, same conversation.
+  Summon repeats pause while nobody is there. Only after 5 s with nobody back does it
+  go DORMANT and end the conversation.
 - Perception stale or error: the state is kept; a far-zone wait that was running restarts.
 
 ## Who owns the LED

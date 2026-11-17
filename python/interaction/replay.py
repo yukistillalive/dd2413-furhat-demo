@@ -210,14 +210,13 @@ def synthetic_segments():
 
 # expected (from, to) transitions, summon lines and opening greetings per segment
 EXPECTED = {
-    "recording": dict(transitions=[(DORMANT, SUMMONING), (SUMMONING, DORMANT),
-                                   (DORMANT, SUMMONING), (SUMMONING, DORMANT)], summons=2, greetings=0),
+    # user-0 -> user-2 id change is inside the 5 s grace: SUMMONING continues, no flicker
+    "recording": dict(transitions=[(DORMANT, SUMMONING), (SUMMONING, DORMANT)], summons=2, greetings=0),
     "approach": dict(transitions=[(DORMANT, SUMMONING), (SUMMONING, AWAKE), (AWAKE, DORMANT)],
                      summons=2, greetings=1),
     "walk_in": dict(transitions=[(DORMANT, AWAKE), (AWAKE, DORMANT)], summons=0, greetings=1),
-    "same_visitor": dict(transitions=[(DORMANT, AWAKE), (AWAKE, DORMANT), (DORMANT, AWAKE),
-                                      (AWAKE, DORMANT), (DORMANT, AWAKE), (AWAKE, DORMANT)],
-                         summons=0, greetings=2, resumes=1),
+    "same_visitor": dict(transitions=[(DORMANT, AWAKE), (AWAKE, DORMANT), (DORMANT, AWAKE), (AWAKE, DORMANT)],
+                         summons=0, greetings=2, resumes=0, sleeps=3),
     "stale": dict(transitions=[(DORMANT, AWAKE), (AWAKE, DORMANT)], summons=0, greetings=1),
 }
 
@@ -275,6 +274,7 @@ async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=No
         greetings=conversation.starts.count(False),
         resumes=conversation.starts.count(True),
         final=controller.state,
+        sleeps=sum(1 for _, call, kw in furhat.calls if call == "gesture" and kw.get("name") == "CloseEyes"),
     )
 
 
