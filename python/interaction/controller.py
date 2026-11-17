@@ -64,7 +64,7 @@ class Visitor:
 
 class InteractionController:
     def __init__(self, furhat, gui, conversation, scenario, config: InteractionConfig | None = None,
-                 clock=time.monotonic, log=print):
+                 clock=time.monotonic, log=print, store=None):
         self.furhat = furhat
         self.gui = gui
         self.conversation = conversation
@@ -72,6 +72,8 @@ class InteractionController:
         self.config = config or InteractionConfig()
         self.clock = clock
         self.log = log
+        # Optional ConversationLog: one visit = person_entered until the Golem sleeps again.
+        self.store = store
         self.state = DORMANT
         self.transitions: list[tuple[float, str, str, str]] = []   # (time, from, to, reason)
         self.visitor: Visitor | None = None
@@ -89,7 +91,17 @@ class InteractionController:
         self.log("[interaction] DORMANT (start)")
         await self._act_dormant()
 
+    def _record(self, name: str, *args, **kwargs):
+        """Call a synchronous ConversationLog method. Logging must never break the controller."""
+        if self.store is None:
+            return
+        try:
+            getattr(self.store, name)(*args, **kwargs)
+        except Exception as e:
+            self.log(f"[interaction] log {name} failed: {e}")
+
     async def stop(self):
+        self._record("end_visit", "shutdown")
         task, self._task = self._task, None
         if task and not task.done():
             task.cancel()
@@ -102,6 +114,8 @@ class InteractionController:
             self.decide(state)
         except Exception as e:   # never let a bad snapshot kill the listener
             self.log(f"[interaction] decide failed, keeping {self.state}: {e}")
+        # After decide(): a person_entered in this snapshot has opened the visit already
+        self._record("log_perception", state, self.state)
 
     def decide(self, state: dict):
         now = self.clock()
@@ -171,6 +185,8 @@ class InteractionController:
         else:
             self.visitor = Visitor()
             self.log(f"[interaction] new visitor {user_id}")
+            self._record("start_visit", None if user_id is None else str(user_id),
+                         self.scenario.scenario.name)
         self._left_visitor = None
 
     def _on_person_left(self, now: float, user_id):
@@ -179,6 +195,7 @@ class InteractionController:
             return
         if self.state == DORMANT:   # never summoned or greeted: nothing to keep
             self.visitor = None
+            self._record("end_visit", "passed_by")
             return
         # Keep the state; sleep only if nobody is back within the grace window (see decide()).
         self._left_at = now
@@ -197,6 +214,9 @@ class InteractionController:
         self._far_since = None
         self.transitions.append((now, old, new_state, reason))
         self.log(f"[interaction] {old} -> {new_state} ({reason})")
+        self._record("log_transition", old, new_state, reason)
+        if new_state == DORMANT:
+            self._record("end_visit", "left")
         visitor = self.visitor
         if new_state == DORMANT:
             self._launch(self._act_dormant)
@@ -246,6 +266,12 @@ class InteractionController:
         line = SUMMON_LINES[index % len(SUMMON_LINES)]
         self.log(f"Robot (summon): {line}")
         await self.furhat.request_speak_text(line, abort=True, wait=True)
+        if self.store is not None:
+            try:
+                await self.store.log_message("robot", line, source="summon",
+                                             mode=self.scenario.scenario.name)
+            except Exception as e:
+                self.log(f"[interaction] log summon line failed: {e}")
 
     async def _act_awake(self):
         await self._quietly(self.furhat.request_speak_stop())

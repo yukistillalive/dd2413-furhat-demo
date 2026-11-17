@@ -227,7 +227,7 @@ EXPECTED = {
 
 # ---- replay ----
 
-async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=None):
+async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=None, store=None):
     """Feed samples through tracker + controller. Returns a result dict."""
     clock = SimClock()
     furhat = FakeFurhat(clock, out)
@@ -238,7 +238,7 @@ async def replay(name, samples, enter=1.2, exit_=1.5, out=print, error_window=No
     gui = GolemGUI(furhat)
     gui.face.led_allowed = lambda: not scenario.owns_led()
     log = lambda text: out(f"  {clock():6.2f}s {text}")
-    controller = InteractionController(furhat, gui, conversation, scenario, clock=clock, log=log)
+    controller = InteractionController(furhat, gui, conversation, scenario, clock=clock, log=log, store=store)
     tracker = PerceptionTracker(PerceptionConfig(enter_distance_m=enter, exit_distance_m=exit_,
                                                  distance_unit="m"), clock=clock)
 

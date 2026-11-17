@@ -89,7 +89,7 @@ async def main(args):
     # Interaction controller: perception state -> DORMANT / SUMMONING / AWAKE
     controller = None
     if args.interaction:
-        controller = InteractionController(furhat, gui, conversation, scenario)
+        controller = InteractionController(furhat, gui, conversation, scenario, store=log)
         await controller.start()
         vision.add_state_listener(controller.on_state)
 
