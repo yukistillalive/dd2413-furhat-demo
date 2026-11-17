@@ -87,6 +87,8 @@ class RealtimeConversation:
         self.wait_for_session = wait_for_session
         self._session_active = False
         self._session_id = 0
+        self._heard_at: float | None = None      # when the visitor's last utterance ended
+        self._pending_reply: dict = {}           # emotion + raw model text for the next spoken reply
         self._session_wake = asyncio.Event()
         self._opening: tuple[str, str] | None = None
         self.clock = time.monotonic
@@ -222,9 +224,10 @@ class RealtimeConversation:
                     if self.wait_for_session:
                         await self._on_silence(session_id)
                     continue
+                self._heard_at = time.monotonic()   # start of the response-time measurement
                 await self._on_visitor_spoke()
                 print("User:", heard)
-                await self._log_message("user", heard)
+                await self._log_message("user", heard, source="asr")
                 command = match_behavior_command(heard)
                 if command:
                     await self._switch_from_voice(command)
@@ -287,17 +290,17 @@ class RealtimeConversation:
             say = fallback
             await self._log_event("opening", "fallback")
         self.history.append(types.Content(role="model", parts=[types.Part(text=say)]))
-        await self._speak(say)
+        await self._speak(say, source="opening")
 
     async def _switch_from_voice(self, name: str):
         try:
             changed = await self.scenario.switch(name)
         except Exception as e:
             print(f"[conversation] voice switch failed: {e}")
-            await self._speak("I could not change mode.")
+            await self._speak("I could not change mode.", source="system")
             return
         if not changed:
-            await self._speak("I am already in that mode.")
+            await self._speak("I am already in that mode.", source="system")
             return
         print(f"[conversation] voice command switched behavior to {name}")
         self.behavior_changed.set()
@@ -312,7 +315,7 @@ class RealtimeConversation:
             return
         self.history.append(types.Content(role="model", parts=[types.Part(text=say)]))
         self._trim_history()
-        await self._speak(say)
+        await self._speak(say, source="cue")
 
     async def _complete(self, heard: str, session_id: int = 0) -> str:
         user = self._user_content(heard, image_b64=self.latest_frame if self.scenario.use_vision else None)
@@ -346,7 +349,7 @@ class RealtimeConversation:
         if self.gui:
             self.gui.idle.filler_speaking = True
         try:
-            await self._speak(FILLER_LINE)
+            await self._speak(FILLER_LINE, source="filler")
         finally:
             if self.gui:
                 self.gui.idle.filler_speaking = False
@@ -374,7 +377,7 @@ class RealtimeConversation:
             await self._log_event("silence", "prompt")
             self.history.append(types.Content(role="model", parts=[types.Part(text=SILENCE_PROMPT)]))
             self._trim_history()
-            await self._speak(SILENCE_PROMPT)   # restarts the silence timer
+            await self._speak(SILENCE_PROMPT, source="silence_prompt")   # restarts the silence timer
         elif self._silence_stage == 1:
             self._silence_stage = 2
             print("[conversation] visitor still silent, farewell and rest")
@@ -391,6 +394,7 @@ class RealtimeConversation:
     async def _perform_reply(self, raw: str) -> str:
         """Show the reply's emotion on the face. Return only the sentence that should be spoken."""
         reply = parse_model_reply(raw)
+        self._pending_reply = {"emotion": reply.emotion, "raw_text": raw}   # logged by _speak()
         if not reply.say and re.search(r"request\.|^\s*[\[{]", raw):
             print("[conversation] withheld reply that looked like a request")
             await self._log_event("appearance", "reply withheld: invalid reply")
@@ -449,8 +453,10 @@ class RealtimeConversation:
             return REPAIR_LINE
         return text
 
-    async def _speak(self, text: str):
+    async def _speak(self, text: str, source: str = "reply"):
+        """source: reply | opening | cue | filler | silence_prompt | system (stored with the message)."""
         print("Robot:", text)
+        started = time.monotonic()
         await self._set_state("speaking")
         try:
             await self.furhat.request_speak_text(text, abort=True, wait=True)
@@ -460,7 +466,14 @@ class RealtimeConversation:
             if not self.shutting_down:
                 print(f"[conversation] Furhat TTS failed: {e}")
             return
-        await self._log_message("robot", text)
+        extra = {"source": source}
+        if source in ("reply", "opening", "cue"):
+            extra.update(self._pending_reply)   # emotion and raw model text of this reply
+            self._pending_reply = {}
+        if source == "reply" and self._heard_at is not None:
+            extra["latency_ms"] = round((started - self._heard_at) * 1000)
+            self._heard_at = None
+        await self._log_message("robot", text, **extra)
         await self._set_state("listening")
         if self._silent_since is not None:
             self._silent_since = None   # silence is counted from the next listen
@@ -476,7 +489,7 @@ class RealtimeConversation:
     async def _set_state(self, state: str):
         await self._emit(type="state", state=state)
 
-    async def _log_message(self, role: str, text: str, interrupted: bool = False):
+    async def _log_message(self, role: str, text: str, interrupted: bool = False, **extra):
         text = (text or "").strip()
         if not text:
             return
@@ -484,7 +497,7 @@ class RealtimeConversation:
         if not self.log:
             return
         try:
-            await self.log.log_message(role, text, interrupted)
+            await self.log.log_message(role, text, interrupted, mode=self.scenario.scenario.name, **extra)
         except Exception as e:
             print("[conversation] log error:", e)
 
