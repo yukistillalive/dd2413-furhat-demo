@@ -8,7 +8,8 @@ from furhat_realtime_api import Events
 import conversation.realtime_conversation as rc
 from gui import GolemGUI
 from interaction import replay
-from interaction.controller import FALLBACK_GREETING
+from interaction.controller import (AWAKE, DORMANT, FALLBACK_GREETING, RESTING, RETURN_LINE, SUMMONING,
+                                    SUMMON_LINES, InteractionController)
 from scenario import ScenarioManager, parse_model_reply
 
 
@@ -245,17 +246,30 @@ class TurnTakingTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.2)
         self.assertNotIn(rc.FILLER_LINE, self.spoken())
 
-    async def test_silence_prompts_once_then_waits_serene(self):
+    async def test_silence_prompt_then_farewell_ends_session(self):
+        rests = []
         silence = [("", rc.NO_SPEECH_TIMEOUT_S)]
-        await self.start(silence * 6 + [("Who are you, golem?", 1)])
+        await self.start([])
+        self.conv.on_rest = lambda: rests.append(self.conv.session_active)
+        self.furhat.script = silence * 4
+        await self.conv._stop_robot_io()   # end the open listen so the script is used
+        await asyncio.sleep(0.3)
+        self.assertEqual(self.spoken(), [FALLBACK_GREETING, rc.SILENCE_PROMPT, rc.SILENCE_FAREWELL])
+        self.assertEqual(rests, [False], "on_rest once, after the session has ended")
+        self.assertFalse(self.conv.session_active)
+
+    async def test_speaking_after_the_prompt_resets_the_timer(self):
+        silence = ("", rc.NO_SPEECH_TIMEOUT_S)
+        await self.start([silence, silence, ("Who are you, golem?", 1), silence])
+        self.assertEqual(self.spoken(), [FALLBACK_GREETING, rc.SILENCE_PROMPT, "I guard the old words."],
+                         "one silent listen after the reply is not enough for anything")
+        self.furhat.script = [silence]
+        await self.conv._stop_robot_io()   # the open listen ends empty too (no clock time)
+        await asyncio.sleep(0.3)
         spoken = self.spoken()
-        self.assertEqual(spoken, [FALLBACK_GREETING, rc.SILENCE_PROMPT, "I guard the old words."])
-        listens = [(mode, expr) for call, _, mode, expr in self.furhat.trace if call == "listen"]
-        # listens 1-2: silent -> prompt; 3-4: silent -> serene; 5-7 stay quiet until the visitor speaks
-        self.assertNotEqual(listens[3][1], "serene")
-        self.assertEqual(listens[4:7], [("quiet", "serene")] * 3)
-        self.assertEqual(self.at_generate, [("thinking", "thinking")], "speaking ends the serene wait")
-        self.assertEqual(self.gui.face._held, {}, "serene eyelids released")
+        self.assertEqual(spoken[-1], rc.SILENCE_PROMPT, "a new silence gets a prompt again, not the farewell")
+        self.assertNotIn(rc.SILENCE_FAREWELL, spoken)
+        self.assertTrue(self.conv.session_active)
 
     async def test_speech_restarts_the_silence(self):
         silence = ("", rc.NO_SPEECH_TIMEOUT_S)
@@ -280,14 +294,96 @@ class TurnTakingTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.3)
         self.assertEqual(self.spoken().count(rc.SILENCE_PROMPT), 1)
 
-    async def test_new_session_resets_silence_and_quiet_mode(self):
+    async def test_new_session_resets_silence(self):
         await self.start([("", rc.NO_SPEECH_TIMEOUT_S)] * 4)
-        self.assertEqual(self.gui.idle.mode, "quiet")
-        await self.conv.end_session()
+        self.assertFalse(self.conv.session_active, "farewell ended the session")
         self.furhat.script = [("", rc.NO_SPEECH_TIMEOUT_S)] * 2
         self.conv.start_session(None, FALLBACK_GREETING)
         await asyncio.sleep(0.3)
-        self.assertEqual(self.spoken().count(rc.SILENCE_PROMPT), 2, "a new visitor gets their own prompt")
+        self.assertEqual(self.spoken().count(rc.SILENCE_PROMPT), 2, "the next session gets its own prompt")
+        self.assertEqual(self.spoken().count(rc.SILENCE_FAREWELL), 1)
+
+
+class RestingFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Real conversation + controller: silence -> prompt -> farewell -> RESTING -> ..."""
+
+    async def asyncSetUp(self):
+        silence = ("", rc.NO_SPEECH_TIMEOUT_S)
+        self.furhat = ScriptedFurhat([silence] * 4)
+        self.scenario = ScenarioManager("golem")
+        self.scenario.bind(self.furhat)
+        await self.scenario.apply()
+        self.gui = GolemGUI(self.furhat)
+        self.gui.face.led_allowed = lambda: not self.scenario.owns_led()
+        self.furhat.gui = self.gui
+        self.conv = rc.RealtimeConversation(self.furhat, self.scenario, api_key="offline-test",
+                                            gui=self.gui, wait_for_session=True)
+        self.conv.clock = lambda: self.furhat.now
+
+        async def fake_generate(contents, remember, use_json=True):
+            return '{"say":"I guard the old words.","emotion":"solemn"}'
+        self.conv._generate = fake_generate
+        self.controller = InteractionController(self.furhat, self.gui, self.conv, self.scenario,
+                                                clock=lambda: self.furhat.now, log=lambda *_: None)
+        self.seq = 0
+        await self.controller.start()
+        self.task = asyncio.create_task(self.conv.run())
+
+    async def asyncTearDown(self):
+        await self.conv.stop()
+        await self.controller.stop()
+        await asyncio.wait({self.task}, timeout=2)
+        await self.scenario.aclose()
+
+    async def state(self, zone, event=None, user="u1"):
+        events = []
+        if event:
+            self.seq += 1
+            events.append({"name": event, "sequence": self.seq, "user_id": user})
+        visible = zone in ("far", "interaction")
+        await self.controller.on_state(dict(status="ok", zone=zone, target_visible=visible, events=events))
+        await asyncio.sleep(0.3)   # robot actions + conversation turns (fake listens are instant)
+
+    def spoken(self):
+        return [kw["text"] for _, call, kw in self.furhat.calls if call == "speak"]
+
+    async def rest(self):
+        await self.state("interaction", "person_entered")
+        self.assertEqual(self.spoken(), [FALLBACK_GREETING, rc.SILENCE_PROMPT, rc.SILENCE_FAREWELL])
+        self.assertEqual(self.controller.state, RESTING)
+        self.assertFalse(self.gui.golem.awake, "gui sleep() after the farewell")
+        self.assertFalse(self.conv.session_active)
+
+    async def test_rest_then_step_back_and_return_wakes_again(self):
+        await self.rest()
+        await self.state("interaction")
+        self.assertEqual(self.controller.state, RESTING, "standing still in the zone does not wake it")
+        for _ in range(4):   # far zone for 20 s: no summoning while resting
+            self.furhat.now += 5
+            await self.state("far")
+        self.assertEqual(self.controller.state, RESTING)
+        self.assertFalse(set(SUMMON_LINES) & set(self.spoken()))
+        await self.state("interaction")
+        self.assertEqual(self.controller.state, AWAKE)
+        self.assertTrue(self.gui.golem.awake)
+        self.assertEqual(self.spoken()[-1], RETURN_LINE)
+        self.assertNotIn(FALLBACK_GREETING, self.spoken()[3:], "no new greeting or clothing line")
+        texts = [p.text for c in self.conv.history for p in c.parts]
+        self.assertIn(rc.SILENCE_FAREWELL, texts, "same visitor: history kept")
+        self.assertTrue(self.conv.session_active)
+
+    async def test_rest_then_person_left_goes_dormant_and_new_visitor_is_summoned(self):
+        await self.rest()
+        await self.state("none", "person_left")
+        self.assertEqual(self.controller.state, RESTING, "grace window first")
+        self.furhat.now += 5.5
+        await self.state("none")
+        self.assertEqual(self.controller.state, DORMANT)
+        await self.state("far", "person_entered", user="u2")
+        self.furhat.now += 2
+        await self.state("far")
+        self.assertEqual(self.controller.state, SUMMONING)
+        self.assertEqual(self.spoken()[-1], SUMMON_LINES[0])
 
 
 class LedOwnerTests(unittest.IsolatedAsyncioTestCase):
